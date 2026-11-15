@@ -1,0 +1,25 @@
+{
+  "name": "mywebview",
+  "version": "1.0.0",
+  "description": "プレゼン用 webview",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win dir --x64 && sh scripts/package-win.sh"
+  },
+  "build": {
+    "appId": "jp.local.mywebview",
+    "productName": "mywebview",
+    "files": ["main.js", "preload.js", "panel/**", "package.json"],
+    "directories": { "output": "dist" },
+    "win": { "target": "dir" }
+  },
+  "keywords": [],
+  "author": "KONISHI Yasuhiro",
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "electron": "^45.3.2",
+    "electron-builder": "^26.18.0"
+  }
+}

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' blob:; style-src 'self' 'unsafe-inline'">
+<title>mywebview コントロールパネル</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --fg: #1d2129; --muted: #6b7280; --line: #d5d9e0;
+    --card: #ffffff; --accent: #2563eb; --accent-bg: #e8efff; --error: #c62828;
+    --marker: #ef4444;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17191d; --fg: #e6e8eb; --muted: #9aa1ab; --line: #343941;
+      --card: #20242a; --accent: #6aa0ff; --accent-bg: #1f2b44; --error: #ff7b7b;
+      --marker: #ff6b6b;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; padding: 16px; display: flex; flex-direction: column; gap: 14px;
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.5 "Segoe UI", "Yu Gothic UI", "Meiryo", system-ui, sans-serif;
+  }
+  hr { width: 100%; border: 0; border-top: 1px solid var(--line); margin: 0; }
+  button, input { font: inherit; color: inherit; }
+
+  /* 上段: URL + プレビュー切替 */
+  #bar { display: flex; gap: 8px; }
+  #url {
+    flex: 1; min-width: 0; padding: 7px 10px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--card);
+  }
+  #url:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .btn {
+    padding: 7px 14px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--card); cursor: pointer; white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn.on { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); }
+  #msg { min-height: 1.5em; margin-top: -8px; font-size: 12px; color: var(--error); }
+
+  /* 中段: URL リスト */
+  #list-head { display: flex; align-items: baseline; gap: 8px; font-size: 12px; color: var(--muted); }
+  #list-head .path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #list-head .btn { padding: 2px 10px; font-size: 12px; }
+  #list {
+    flex: 1; min-height: 80px; overflow-y: auto; margin: -6px 0 0; padding: 0; list-style: none;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  #list button {
+    width: 100%; text-align: left; padding: 7px 12px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--card); cursor: pointer;
+    display: flex; gap: 12px; align-items: baseline;
+  }
+  #list button:hover { border-color: var(--accent); }
+  #list button.current { background: var(--accent-bg); border-color: var(--accent); }
+  #list .name { font-weight: 600; white-space: nowrap; }
+  #list .u { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #list-error { font-size: 12px; color: var(--error); }
+
+  /* 下段: プレビュー */
+  #preview-wrap[hidden] { display: none; }
+  #preview-info { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .ruler { position: relative; height: 10px; }
+  .ruler i { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--marker); }
+  #frame {
+    position: relative; width: 100%; background: #000; border: 1px solid var(--line);
+    overflow: hidden;
+  }
+  #frame:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #frame img {
+    position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; display: block;
+    user-select: none;
+  }
+  /* キー入力（IME 含む）を受けるための見えない入力欄 */
+  #kbd {
+    position: absolute; left: 0; top: 0; width: 1px; height: 1px; padding: 0; border: 0;
+    opacity: 0; resize: none; pointer-events: none;
+  }
+  #frame .split {
+    position: absolute; top: 0; bottom: 0; width: 0; margin-left: -1px;
+    border-left: 2px dashed var(--marker); opacity: .85; pointer-events: none;
+  }
+  #frame .label {
+    position: absolute; top: 4px; padding: 0 6px; font-size: 11px; line-height: 18px;
+    color: #fff; background: rgba(0,0,0,.55); border-radius: 3px; transform: translateX(-50%);
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <form id="bar">
+    <input id="url" type="text" spellcheck="false" autocomplete="off" placeholder="URL を入力して Enter">
+    <button id="mode-toggle" type="button" class="btn"
+            title="疑似表示: モニターには出さずプレビューのみ / 実表示: モニターに表示">表示モード</button>
+    <button id="preview-toggle" type="button" class="btn">プレビュー</button>
+  </form>
+  <div id="msg"></div>
+
+  <hr>
+
+  <div id="list-head">
+    <span class="path" id="list-path"></span>
+    <button id="list-reload" type="button" class="btn">再読込</button>
+  </div>
+  <div id="list-error"></div>
+  <ul id="list"></ul>
+
+  <hr>
+
+  <section id="preview-wrap">
+    <div id="preview-info"></div>
+    <div class="ruler" id="ruler-top"></div>
+    <div id="frame" title="クリックで操作（キー入力もページに送られます）">
+      <img id="preview-img" alt="" draggable="false">
+      <textarea id="kbd" aria-label="キー入力" spellcheck="false" autocomplete="off"></textarea>
+    </div>
+    <div class="ruler" id="ruler-bottom"></div>
+  </section>
+
+  <script src="panel.js"></script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+# 1 行に 1 件:「表示名, URL」  （# で始まる行はコメント）
+google, https://www.google.com/
+google map, https://www.google.com/maps
+yahoo japan, https://www.yahoo.co.jp/

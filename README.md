@@ -57,6 +57,16 @@ apps\           … アプリ本体
 
 Linux 上でビルドできます（Wine は不要）。
 
+## リリース手順
+
+1. `package.json` の `version` を上げてコミット・push
+2. ZIP を作成: `npm run dist:win`
+   - `package.json` はアプリ本体に含まれるため、`package.json` を変更したら（メタデータだけでも）ZIP を作り直す
+3. Release を作成して ZIP を添付:
+   ```sh
+   gh release create vX.Y.Z dist/mywebview-X.Y.Z-win.zip --target main --title vX.Y.Z --notes "..."
+   ```
+
 ## ライセンス
 
 MIT

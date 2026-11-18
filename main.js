@@ -564,6 +564,9 @@ app.whenReady().then(() => {
     focusOnShow = false;
     if (next) {
       next.show({ focus }); // ウィンドウがまだ無ければ、見つかったときにフォーカスを移す
+      // 前に出そうとした exe が終了していた（show() の中で気づく）ときは、onExeChange() が 1 つ前の表示に
+      // 戻し終えている。続けると、戻した表示用ウィンドウを隠してしまう（何も映らなくなる）
+      if (front !== next) return;
       if (alive() && !virtual) display.hide();
     } else if (alive() && !virtual && displayReady) { // 最初の描画前なら ready-to-show で出る
       display.showInactive(); // パネルからフォーカスを奪わない（パネルで選んだときは下で移す）
@@ -638,7 +641,7 @@ app.whenReady().then(() => {
       sendRunning();
     }
     bringToFront(exe, { focus });
-    if (isNew) setStatus(['起動中…', exeNote()].filter(Boolean).join('　'));
+    if (isNew && !exe.ended) setStatus(['起動中…', exeNote()].filter(Boolean).join('　')); // 終了の表示は上書きしない
     return null;
   }
 

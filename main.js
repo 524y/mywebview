@@ -693,10 +693,15 @@ app.whenReady().then(() => {
     }
     if (blackout && virtual) setBlackout(false);
     layoutNotes = layoutNotesFor(l);
-    if (!panel.isDestroyed()) {
+    // パネルをプライマリに置き直す。既にプライマリで最大化されていれば触らない（最大化し直すとパネルが
+    // アクティブになり、表示側からフォーカスを奪う。モニターが一瞬切れただけで発表者のキー操作が効かなくなる）
+    if (!panel.isDestroyed() && !(panel.isMaximized() &&
+        screen.getDisplayMatching(panel.getBounds()).id === screen.getPrimaryDisplay().id)) {
+      const onDisplay = focusState() === 'display';
       if (panel.isMaximized()) panel.unmaximize();
       panel.setBounds(panelBoundsFor(bounds, true));
       panel.maximize();
+      if (onDisplay) focusFront(); // 置き直しでパネルに移ったフォーカスを、表示側に戻す
     }
     sendToPanel('display:layout', { requested: { ...bounds }, notes: layoutNotes });
   }

@@ -4,7 +4,7 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const fs = require('node:fs');
 const { parseArgs } = require('node:util');
-const { parseExe, launchExe } = require('./exe');
+const { parseExe, launchExe, placeTopmost } = require('./exe');
 
 // 何も表示しない（黒い画面）。起動時に表示対象を指定しなかったとき
 const BLANK = `data:text/html,${encodeURIComponent('<html style="background:#000;cursor:none"><!--mywebview-blank--></html>')}`;
@@ -417,6 +417,7 @@ app.whenReady().then(() => {
       if (!virtual && !front) { // exe を前に出していたら、Web ページに切り替えたときに出す
         win.showInactive(); // パネルからフォーカスを奪わない（パネルで選んだときは下で移す）
         win.setBounds(bounds);
+        if (display === win) keepDisplayOnTop();
         if (focusOnShow && display === win) win.focus();
       }
       if (display === win) focusOnShow = false;
@@ -481,6 +482,10 @@ app.whenReady().then(() => {
       failed = false;
     });
     win.webContents.on('did-navigate-in-page', onNavigate);
+    // アクティブになると（パネルから選んだとき・直接クリックされたとき等）一番上に上がるので、幕・画面消去の下に戻す
+    win.on('focus', () => {
+      if (display === win) enforceOrderSoon();
+    });
     win.on('resize', onBoundsChange);
     win.on('move', onBoundsChange);
     win.on('show', onBoundsChange);
@@ -512,8 +517,50 @@ app.whenReady().then(() => {
     onBoundsChange();
   }
 
+  // ---- 重なり順（Windows） ----
+  //   拡張モニターのタスクバーは最前面のウィンドウなので、パネルにフォーカスがあると表示の上に出てくることがある
+  //   （幕・画面消去のウィンドウを隠したとき等に、Windows が出し直す）。
+  //   表示用ウィンドウ・exe も最前面にし、順番は 幕 > 画面消去 > 表示用ウィンドウ・exe > タスクバー にする
+  const hwndOf = (win) => {
+    const b = win.getNativeWindowHandle();
+    return Number(b.length >= 8 ? b.readBigUInt64LE(0) : b.readUInt32LE(0));
+  };
+  // 表示用ウィンドウ・exe を置く位置: 見えている重ねるウィンドウのうち一番下のもののすぐ下。無ければ 0（最前面の一番上）
+  //   隠れているものは基準にしない（隠す前の位置のままなので、後から出した幕より上にあることがある）。
+  //   見えているものが両方なら、幕は画面消去より上（setBlackout で出し直している）なので画面消去が一番下
+  const overlayAnchor = () => {
+    const win = [blackWin, curtainWin].find((v) => v && !v.isDestroyed() && v.isVisible());
+    return win ? hwndOf(win) : 0;
+  };
+  function keepDisplayOnTop() {
+    if (process.platform !== 'win32' || virtual || !alive() || !display.isVisible()) return;
+    try {
+      placeTopmost(hwndOf(display), overlayAnchor());
+    } catch (e) {
+      logError(e); // koffi が読み込めない等。タスクバーが手前に出ることがあるだけなので動き続ける
+    }
+  }
   // 幕は画面消去の黒いウィンドウより手前（黒いウィンドウを出し直したら、幕も出し直す）
   const curtainShown = () => curtainWin && !curtainWin.isDestroyed() && curtainWin.isVisible();
+  // 重なり順を 幕 > 画面消去 > 表示用ウィンドウ・exe > タスクバー に整える。
+  //   OS がアクティブにしたウィンドウやタスクバーを後から上げ直すことがあるので、出来事のたびと定期的に行う
+  function enforceOrder() {
+    if (process.platform !== 'win32' || virtual) return;
+    try {
+      if (front) front.raise();
+      else keepDisplayOnTop();
+    } catch (e) {
+      logError(e);
+    }
+    if (blackout && blackWin && !blackWin.isDestroyed() && blackWin.isVisible()) blackWin.moveTop();
+    if (curtainShown()) curtainWin.moveTop();
+  }
+  // すぐと、OS が上げ直し終わった頃に
+  const enforceOrderSoon = () => {
+    enforceOrder();
+    for (const ms of [0, 50, 200, 500]) setTimeout(enforceOrder, ms);
+  };
+
   // ---- 画面を消す（表示領域を最前面の黒いウィンドウで覆う。Web ページ・exe のどちらの上にも出る） ----
   // プレビューには裏の実際の内容が映り続ける（消している間に次の準備ができる）
   let blackout = false;
@@ -541,6 +588,7 @@ app.whenReady().then(() => {
       if (curtainShown()) curtainWin.moveTop();
     } else if (blackWin && !blackWin.isDestroyed()) {
       blackWin.hide();
+      enforceOrderSoon(); // 隠すと Windows がタスクバーを上げ直すので、表示を上に戻す
     }
     sendToPanel('display:blackout', blackout);
     return blackout;
@@ -567,7 +615,7 @@ app.whenReady().then(() => {
       webPreferences: { backgroundThrottling: false },
     });
     curtainWin.setAlwaysOnTop(true, 'screen-saver'); // exe のウィンドウより上に出す
-    // クリックは幕で受け止める（閉めている間は、裏の表示用ウィンドウ・exe を誤って操作させない）
+    // クリックは幕で受け止める（素通りさせると、裏の表示用ウィンドウがアクティブになって幕より上に上がる）
     curtainWin.loadFile(path.join(__dirname, 'panel', 'curtain.html'), { query: { img: curtainImage() } });
     return curtainWin;
   }
@@ -591,6 +639,7 @@ app.whenReady().then(() => {
       if (!close && !curtainClosed && !win.isDestroyed()) {
         win.hide();
         if (refocusOnCurtainOpen) focusFront();
+        enforceOrderSoon(); // 隠すと Windows がタスクバーを上げ直すので、表示を上に戻す
       }
     });
     return curtainClosed;
@@ -634,7 +683,9 @@ app.whenReady().then(() => {
     } else if (alive() && !virtual && displayReady) { // 最初の描画前なら ready-to-show で出る
       display.showInactive(); // パネルからフォーカスを奪わない（パネルで選んだときは下で移す）
       display.setBounds(bounds);
-      display.moveTop();
+      // Windows は重なり順を整える（moveTop だと一瞬 幕・画面消去より手前に出る）
+      if (process.platform === 'win32') enforceOrderSoon();
+      else display.moveTop();
       if (focus) display.focus();
     } else if (focus && !virtual) {
       focusOnShow = true;
@@ -696,7 +747,7 @@ app.whenReady().then(() => {
     const isNew = !exe;
     if (isNew) {
       try {
-        exe = launchExe(t.exe, () => screen.dipToScreenRect(null, bounds), (m) => onExeChange(exe, m));
+        exe = launchExe(t.exe, () => screen.dipToScreenRect(null, bounds), (m) => onExeChange(exe, m), overlayAnchor);
       } catch (e) {
         return `exe を起動できません: ${e.message}`;
       }
@@ -729,7 +780,10 @@ app.whenReady().then(() => {
     replaceTimer = setTimeout(() => {
       if (opts.auto) relayout();
       if (front) front.show();
-      else if (alive() && displayReady && (!virtual || opts.auto)) display.setBounds(bounds); // 疑似表示はサイズだけ
+      else if (alive() && displayReady && (!virtual || opts.auto)) {
+        display.setBounds(bounds); // 疑似表示はサイズだけ
+        keepDisplayOnTop();
+      }
       if (blackout) setBlackout(true);
       if (curtainClosed && curtainWin && !curtainWin.isDestroyed()) curtainWin.setBounds(bounds);
       onBoundsChange();
@@ -789,6 +843,7 @@ app.whenReady().then(() => {
   let focus = focusState();
   let prevFocus = focus; // 1 つ前のフォーカスの場所（パネルのボタンを押す前にどこにあったか）
   setInterval(() => {
+    enforceOrder(); // 重なり順も定期的に整える（タスクバー・アクティブになったウィンドウが上がってきても戻す）
     const next = focusState();
     if (next === focus) return;
     prevFocus = focus;

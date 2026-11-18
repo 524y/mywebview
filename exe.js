@@ -89,7 +89,8 @@ const GWL_STYLE = -16, GWL_EXSTYLE = -20, GCL_STYLE = -26, GW_OWNER = 4, GA_ROOT
 const WS_CAPTION = 0x00C00000, FRAME_STYLE = WS_CAPTION | 0x00040000; // | WS_THICKFRAME
 const FRAME_EXSTYLE = 0x1 | 0x100 | 0x200 | 0x20000;         // WS_EX_DLGMODALFRAME | WINDOWEDGE | CLIENTEDGE | STATICEDGE
 const WS_EX_TOOLWINDOW = 0x80, CS_DBLCLKS = 0x8, DWMWA_EXTENDED_FRAME_BOUNDS = 9, DWMWA_CLOAKED = 14;
-const SWP_NOACTIVATE = 0x10, SWP_FRAMECHANGED = 0x20, SWP_SHOWWINDOW = 0x40, SWP_ASYNCWINDOWPOS = 0x4000;
+const SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOACTIVATE = 0x10, SWP_FRAMECHANGED = 0x20, SWP_SHOWWINDOW = 0x40, SWP_ASYNCWINDOWPOS = 0x4000;
+const HWND_TOPMOST = -1;
 const SW_SHOWNOACTIVATE = 4, SW_SHOWMINNOACTIVE = 7, WM_NULL = 0, SMTO_ABORTIFHUNG = 0x2, PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 const RDW_INVALIDATE = 0x1, RDW_ERASE = 0x4, RDW_ALLCHILDREN = 0x80, RDW_FRAME = 0x400;
 const CWP_SKIPINVISIBLE = 0x1, CWP_SKIPTRANSPARENT = 0x4;
@@ -163,10 +164,18 @@ function processInfo(pid) {
   }
 }
 
+// 常に手前（最前面）のウィンドウにして、after のすぐ下に置く（after が無ければ最前面の一番上）。
+//   拡張モニターのタスクバーより手前に出すため。after は幕・画面消去の黒いウィンドウ（それより手前には出さない）
+function placeTopmost(hwnd, after = 0, flags = 0) {
+  win32();
+  return w.SetWindowPos(hwnd, after || HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | flags);
+}
+
 // exe を起動してウィンドウを探し、getRect() の位置（物理ピクセル）に枠なしで置く。hide() で最小化して背面に回す
 //   onChange(message?): ウィンドウが見つかった・閉じた・位置が変わった・終了した（ended が true）ときに呼ばれる。
 //   message は状態表示用
-function launchExe({ file, args, text }, getRect, onChange) {
+//   getInsertAfter(): 置くときに、このウィンドウ（HWND）のすぐ下の最前面に置く（0 なら最前面の一番上）
+function launchExe({ file, args, text }, getRect, onChange, getInsertAfter = () => 0) {
   win32();
   const exeName = path.win32.basename(file).toLowerCase();
   const launchedAt = Date.now();
@@ -215,6 +224,16 @@ function launchExe({ file, args, text }, getRect, onChange) {
   // mywebview（UI 含む）まで止まる。応答を確かめてから変え、応答しなければ次の周期でやり直す
   const responsive = () => w.SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 50, null) !== 0;
 
+  // 幕・画面消去のウィンドウのすぐ下（最前面）に置き直す（アクティブにすると一番上に上がるため）。
+  // 相手が応答しなくても待たないよう非同期
+  const underOverlays = () => w.SetWindowPos(hwnd, getInsertAfter() || HWND_TOPMOST, 0, 0, 0, 0,
+    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+  // アクティブにする（以降のキー入力を exe に向ける）。幕・画面消去より上には出さない
+  const activate = () => {
+    w.SetForegroundWindow(hwnd);
+    underOverlays();
+  };
+
   const place = () => {
     if (!responsive()) return false;
     const r = getRect();
@@ -238,7 +257,9 @@ function launchExe({ file, args, text }, getRect, onChange) {
       if (ex & FRAME_EXSTYLE) w.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex & ~FRAME_EXSTYLE) >>> 0);
       flags |= SWP_FRAMECHANGED;
     }
-    w.SetWindowPos(hwnd, 0, r.x - e.l, r.y - e.t, r.width + e.l + e.r, r.height + e.t + e.b, flags);
+    // 最前面（拡張モニターのタスクバーより手前）にして、幕・画面消去のウィンドウのすぐ下に置く
+    w.SetWindowPos(hwnd, getInsertAfter() || HWND_TOPMOST,
+      r.x - e.l, r.y - e.t, r.width + e.l + e.r, r.height + e.t + e.b, flags);
     // 付け直された枠が描かれたまま残らないよう、全体を描き直させる
     if (!keepFrame) w.RedrawWindow(hwnd, null, null, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
     return true;
@@ -288,7 +309,10 @@ function launchExe({ file, args, text }, getRect, onChange) {
     }
     if (wantFocus && placedAt) {
       wantFocus = false;
-      w.SetForegroundWindow(hwnd);
+      activate();
+    } else if (getInsertAfter()) {
+      // 幕・画面消去が出ている間は、アプリ側でアクティブになって（クリック・ダイアログ等）上に出ても下に戻す
+      underOverlays();
     }
     const r = JSON.stringify(visibleRectOf(hwnd));
     if (r !== lastRect) {
@@ -325,9 +349,13 @@ function launchExe({ file, args, text }, getRect, onChange) {
     get hwnd() { return hwnd; },
     get ended() { return closed; },
     rect: () => (hwnd ? visibleRectOf(hwnd) : null),
+    // 重なり順を整える（幕・画面消去のすぐ下、無ければ最前面の一番上に置き直す。アクティブにはしない）
+    raise() {
+      if (hwnd && !hidden && !closed) underOverlays();
+    },
     // フォーカスを移す（アクティブにする）
     focus() {
-      if (hwnd && !hidden) w.SetForegroundWindow(hwnd);
+      if (hwnd && !hidden) activate();
     },
     // アクティブ（キー入力を受け取る）か。このウィンドウが出したダイアログ（保存の確認等）がアクティブな場合も含む
     focused() {
@@ -370,7 +398,7 @@ function launchExe({ file, args, text }, getRect, onChange) {
       if (ev.type === 'mouseMove') {
         w.PostMessageW(target, WM_MOUSEMOVE, keys, lp);
       } else if (ev.type === 'mouseDown') {
-        w.SetForegroundWindow(hwnd); // 以降のキー入力を exe に向ける
+        activate(); // 以降のキー入力を exe に向ける
         captured = target;
         const dblclk = ev.clickCount >= 2 && (w.GetClassLongPtrW(target, GCL_STYLE) & CS_DBLCLKS);
         w.PostMessageW(target, dblclk ? dbl : down, keys, lp);
@@ -410,4 +438,4 @@ function launchExe({ file, args, text }, getRect, onChange) {
   };
 }
 
-module.exports = { parseExe, launchExe, SIGS, defineTypes };
+module.exports = { parseExe, launchExe, placeTopmost, SIGS, defineTypes };

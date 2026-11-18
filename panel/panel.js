@@ -212,6 +212,18 @@ function setPreviewState(on) {
   updateVideo();
 }
 previewBtn.addEventListener('click', async () => setPreviewState(await window.api.setPreview(!previewOn)));
+window.api.onPreview(setPreviewState);
+
+// ---- 表示領域の自動配置（モニター構成が変わると決め直される） ----
+function setLayoutNotes(notes) {
+  const el = $('#layout-note');
+  el.textContent = notes.map((n) => `⚠ ${n}`).join('\n');
+  el.hidden = !notes.length;
+}
+window.api.onLayout(({ requested: r, notes }) => {
+  requested = r;
+  setLayoutNotes(notes);
+});
 
 // ---- 表示モード（疑似表示 ⇔ 実表示） ----
 const modeBtn = $('#mode-toggle');
@@ -398,6 +410,7 @@ window.api.onBounds(setupPreview);
 (async () => {
   const s = await window.api.init();
   requested = s.requested;
+  setLayoutNotes(s.layoutNotes);
   running = s.running;
   focusWhere = s.focus;
   selected = s.selected;

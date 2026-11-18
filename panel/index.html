@@ -43,6 +43,12 @@
   .btn.on { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); }
   .btn:disabled { opacity: .5; cursor: default; }
   #blackout.active { background: var(--error); border-color: var(--error); color: #fff; font-weight: 600; }
+  /* 表示領域の自動配置についての注意（モニターの並び等。消えずに出し続ける） */
+  #layout-note {
+    margin-top: -8px; padding: 6px 10px; border: 1px solid var(--error); border-radius: 6px;
+    font-size: 12px; color: var(--error); white-space: pre-line;
+  }
+  #layout-note[hidden] { display: none; }
   #msg { min-height: 1.5em; margin-top: -8px; font-size: 12px; color: var(--error); }
 
   /* 中段: URL リスト */
@@ -124,6 +130,7 @@
     <button id="blackout" type="button" class="btn" title="表示領域（モニター）を真っ黒にします">画面を消す</button>
   </form>
   <div id="msg"></div>
+  <div id="layout-note" hidden></div>
 
   <hr>
 

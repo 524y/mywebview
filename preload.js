@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld('api', {
   onSource: (cb) => ipcRenderer.on('preview:source', (_e, id) => cb(id)),
   onStatus: (cb) => ipcRenderer.on('display:status', (_e, m) => cb(m)),
   onRunning: (cb) => ipcRenderer.on('display:running', (_e, list) => cb(list)),
+  onPreview: (cb) => ipcRenderer.on('display:preview', (_e, on) => cb(on)),
+  onLayout: (cb) => ipcRenderer.on('display:layout', (_e, layout) => cb(layout)),
   onBlackout: (cb) => ipcRenderer.on('display:blackout', (_e, on) => cb(on)),
   onFocus: (cb) => ipcRenderer.on('display:focus', (_e, where) => cb(where)),
 });

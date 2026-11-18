@@ -54,6 +54,7 @@ function parseTarget(raw) {
 // 引数を解析する
 //   開発時:       electron . [URL|EXE] [--x N] [--y N] [--w N] [--h N] [--virtual | --real] [--debug]
 //   パッケージ後: mywebview [URL|EXE] [--x N] [--y N] [--w N] [--h N] [--virtual | --real] [--debug]
+//   --x/--y/--w/--h を 1 つも指定しなければ、プライマリ以外のモニター全部を表示領域にする（無ければ既定値で疑似表示）
 //   --virtual: 疑似表示（画面に出さずプレビューのみ） / --real: 実表示（モニターに収まらなくても表示）
 //   どちらも無ければ、表示領域がモニターに収まらないときに疑似表示
 function parseOptions() {
@@ -92,6 +93,8 @@ function parseOptions() {
 
   return {
     target: raw,
+    // 位置・サイズを 1 つも指定しなければ、モニターの構成から自動で決める（autoLayout()）
+    auto: [values.x, values.y, values.w, values.width, values.h, values.height].every((v) => v === undefined),
     x:      toInt('x', values.x, DEFAULTS.x, -Infinity),
     y:      toInt('y', values.y, DEFAULTS.y, -Infinity),
     width:  toInt('w', values.w ?? values.width, DEFAULTS.width, 1),
@@ -163,21 +166,49 @@ function coveredByDisplays(b) {
 const intersects = (a, b) =>
   a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 
-// コントロールパネルの位置: 表示用ウィンドウと重ならない一番左のディスプレイ（無ければプライマリ）
-function panelBoundsFor(displayBounds) {
-  const free = screen.getAllDisplays()
+// 表示領域の自動決定: プライマリ以外のモニターをすべて囲む長方形
+//   → { bounds, notes }（notes: パネルに出す注意）| null（拡張モニターが無い）
+function autoLayout() {
+  const primary = screen.getPrimaryDisplay();
+  let ext = screen.getAllDisplays().filter((d) => d.id !== primary.id);
+  if (!ext.length) return null;
+  const notes = [];
+  const union = (ds) => {
+    const x = Math.min(...ds.map((d) => d.bounds.x));
+    const y = Math.min(...ds.map((d) => d.bounds.y));
+    const right = Math.max(...ds.map((d) => d.bounds.x + d.bounds.width));
+    const bottom = Math.max(...ds.map((d) => d.bounds.y + d.bounds.height));
+    return { x, y, width: right - x, height: bottom - y };
+  };
+  let b = union(ext);
+  if (intersects(b, primary.bounds)) {
+    // プライマリを挟んで両側に拡張モニターがある（囲むとプライマリまで覆う）: 広い方の側だけを使う
+    const p = primary.bounds;
+    const right = ext.filter((d) => d.bounds.x >= p.x + p.width);
+    const rest = ext.filter((d) => !right.includes(d));
+    const area = (ds) => ds.reduce((s, d) => s + d.bounds.width * d.bounds.height, 0);
+    if (right.length && rest.length) {
+      ext = area(right) >= area(rest) ? right : rest;
+      b = union(ext);
+      notes.push('拡張モニターがプライマリの両側にあるため、片側のモニターだけに表示しています');
+    }
+  }
+  if (!coveredByDisplays(b)) {
+    notes.push('拡張モニターの並びが長方形になっていないため、表示領域の一部はどのモニターにも映りません');
+  }
+  if (new Set(ext.map((d) => d.scaleFactor)).size > 1) {
+    notes.push('拡張モニターの表示倍率（拡大率）がそろっていないため、正しく表示されない場合があります');
+  }
+  return { bounds: b, notes };
+}
+
+// コントロールパネルの位置・サイズ: ディスプレイの作業領域いっぱい（Windows はタスクバーを除いた範囲）
+//   自動配置ではプライマリ。指定時は表示用ウィンドウと重ならない一番左のディスプレイ（無ければプライマリ）
+function panelBoundsFor(displayBounds, usePrimary) {
+  const free = usePrimary ? [] : screen.getAllDisplays()
     .filter((d) => !intersects(d.bounds, displayBounds))
     .sort((a, b) => a.bounds.x - b.bounds.x);
-  const wa = (free[0] ?? screen.getPrimaryDisplay()).workArea;
-  // Windows は作業領域にタスクバーが反映されるので高さいっぱいに使う。
-  // それ以外（Linux の Wayland 等）は反映されないことがあるので余白を取る
-  const width = Math.min(1100, wa.width - 40);
-  const height = process.platform === 'win32' ? wa.height : Math.min(800, wa.height - 100);
-  return {
-    x: Math.round(wa.x + (wa.width - width) / 2),
-    y: Math.round(wa.y + (wa.height - height) / 2),
-    width, height,
-  };
+  return { ...(free[0] ?? screen.getPrimaryDisplay()).workArea };
 }
 
 app.whenReady().then(() => {
@@ -193,13 +224,25 @@ app.whenReady().then(() => {
     return;
   }
 
-  const bounds = { x: opts.x, y: opts.y, width: opts.width, height: opts.height };
+  // 表示領域。自動配置ではモニター構成が変わると中身を置き換える（参照は保ったまま）
+  const layout = opts.auto ? autoLayout() : null;
+  const bounds = layout ? { ...layout.bounds } : { x: opts.x, y: opts.y, width: opts.width, height: opts.height };
 
   // 表示モード
   //   疑似表示: 画面には出さずにオフスクリーンで指定サイズのまま描画し、プレビューだけに表示する
   //   実表示:   実際にウィンドウを表示し、それをキャプチャしてプレビューする
-  // 指定が無ければ、表示領域が接続中のモニターに収まらない（外部モニターが無い等）ときに疑似表示
-  let virtual = opts.virtual ? true : opts.real ? false : !coveredByDisplays(bounds);
+  // 指定が無ければ、自動配置で拡張モニターがあれば実表示（並びが長方形でなくても）。
+  // それ以外は、表示領域が接続中のモニターに収まらない（外部モニターが無い等）ときに疑似表示
+  const autoVirtual = (l) => (l ? false : !coveredByDisplays(bounds));
+  let virtual = opts.virtual ? true : opts.real ? false : opts.auto ? autoVirtual(layout) : !coveredByDisplays(bounds);
+  // 表示領域についての注意（パネルに出し続ける）
+  const layoutNotesFor = (l) => {
+    if (!opts.auto) return [];
+    if (l) return l.notes;
+    return [`拡張モニターが見つからないため、既定のサイズ（${bounds.width}×${bounds.height}）で` +
+      `${virtual ? '疑似表示しています' : '表示しています'}`];
+  };
+  let layoutNotes = layoutNotesFor(layout);
 
   let display = null;       // 表示用ウィンドウ（Web ページ。モード切替で作り直す。exe を前に出している間は隠す）
   let displayReady = false; // 表示用ウィンドウの最初の描画が済んだか（済む前に出すと白い画面が見える）
@@ -218,10 +261,11 @@ app.whenReady().then(() => {
 
   // ---- コントロールパネル ----
   const panel = new BrowserWindow({
-    ...panelBoundsFor(bounds),
+    ...panelBoundsFor(bounds, opts.auto),
     title: 'mywebview コントロールパネル',
     webPreferences: { preload: path.join(__dirname, 'preload.js') },
   });
+  panel.maximize(); // 置いたディスプレイいっぱいに（作業領域に合わせて置いてから最大化する）
   panel.removeMenu();
   panel.loadFile(path.join(__dirname, 'panel', 'index.html'));
   // パネルにファイルやリンクを落としても、パネル自体を別のページに移動させない
@@ -611,13 +655,42 @@ app.whenReady().then(() => {
   const replaceLater = () => {
     clearTimeout(replaceTimer);
     replaceTimer = setTimeout(() => {
+      if (opts.auto) relayout();
       if (front) front.show();
-      else if (alive() && !virtual && displayReady) display.setBounds(bounds);
+      else if (alive() && displayReady && (!virtual || opts.auto)) display.setBounds(bounds); // 疑似表示はサイズだけ
       if (blackout) setBlackout(true);
       onBoundsChange();
     }, REPLACE_DELAY_MS);
   };
   for (const ev of ['display-added', 'display-removed', 'display-metrics-changed']) screen.on(ev, replaceLater);
+
+  // 自動配置: モニター構成が変わったら表示領域を決め直す。拡張モニターがすべて外れたら、元の表示領域のまま
+  // （ケーブルが一時的に抜けただけで、表示中のページのレイアウトを変えないため）
+  function relayout() {
+    const l = autoLayout();
+    if (l) Object.assign(bounds, l.bounds);
+    // 表示モードを指定していなければ、拡張モニターの有無に合わせて切り替える（exe 表示中は常に実表示）
+    if (!opts.virtual && !opts.real && !front) {
+      const next = autoVirtual(l);
+      if (next !== virtual) {
+        setVirtual(next);
+        // 疑似表示はプレビューでしか見えないので ON にする
+        if (next && !previewOn) {
+          previewOn = true;
+          setPreview(true);
+          sendToPanel('display:preview', true);
+        }
+      }
+    }
+    if (blackout && virtual) setBlackout(false);
+    layoutNotes = layoutNotesFor(l);
+    if (!panel.isDestroyed()) {
+      if (panel.isMaximized()) panel.unmaximize();
+      panel.setBounds(panelBoundsFor(bounds, true));
+      panel.maximize();
+    }
+    sendToPanel('display:layout', { requested: { ...bounds }, notes: layoutNotes });
+  }
 
   // ---- フォーカスの場所（パネルに表示する） ----
   //   'display': 表示側（Web ページ・前に出している exe）/ 'panel': コントロールパネル / 'other': 他のアプリ等
@@ -658,7 +731,8 @@ app.whenReady().then(() => {
     selected: selectedKey(),
     web: webState(),
     list: loadUrlList(),
-    requested: bounds,
+    requested: { ...bounds },
+    layoutNotes,
     bounds: currentBounds(),
     frame: lastFrame,
     source: sourceId(),

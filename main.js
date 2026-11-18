@@ -1,6 +1,7 @@
 // main.js
 const { app, BrowserWindow, dialog, screen, ipcMain, powerSaveBlocker } = require('electron');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 const fs = require('node:fs');
 const { parseArgs } = require('node:util');
 const { parseExe, launchExe } = require('./exe');
@@ -511,6 +512,8 @@ app.whenReady().then(() => {
     onBoundsChange();
   }
 
+  // 幕は画面消去の黒いウィンドウより手前（黒いウィンドウを出し直したら、幕も出し直す）
+  const curtainShown = () => curtainWin && !curtainWin.isDestroyed() && curtainWin.isVisible();
   // ---- 画面を消す（表示領域を最前面の黒いウィンドウで覆う。Web ページ・exe のどちらの上にも出る） ----
   // プレビューには裏の実際の内容が映り続ける（消している間に次の準備ができる）
   let blackout = false;
@@ -535,11 +538,62 @@ app.whenReady().then(() => {
       }
       blackWin.showInactive(); // パネルからフォーカスを奪わない
       blackWin.setBounds(bounds); // 複数モニターにまたがると作成時に OS 側でサイズが調整されることがある
+      if (curtainShown()) curtainWin.moveTop();
     } else if (blackWin && !blackWin.isDestroyed()) {
       blackWin.hide();
     }
     sendToPanel('display:blackout', blackout);
     return blackout;
+  }
+
+  // ---- 緞帳（幕を下ろして表示領域を隠す・上げて見せる。透明なウィンドウを最前面に重ねて幕を動かす） ----
+  //   幕の絵柄は url_list.txt と同じ場所の curtain.png / .jpg / .webp（無ければ CSS で描いた赤い幕）。
+  //   閉めている間もプレビューには裏の実際の内容が映る。開けたら、閉める前に表示側にあったフォーカスを戻す
+  let curtainClosed = false;
+  let curtainWin = null;
+  let curtainQueue = Promise.resolve(); // 開け閉めの動きを順に行う
+  let refocusOnCurtainOpen = false;
+  function curtainImage() {
+    const dir = path.dirname(findUrlListPath());
+    const file = ['curtain.png', 'curtain.jpg', 'curtain.jpeg', 'curtain.webp']
+      .map((n) => path.join(dir, n)).find((p) => fs.existsSync(p));
+    return file ? pathToFileURL(file).href : '';
+  }
+  function curtainWindow() {
+    if (curtainWin && !curtainWin.isDestroyed()) return curtainWin;
+    curtainWin = new BrowserWindow({
+      ...bounds, frame: false, show: false, transparent: true, hasShadow: false,
+      focusable: false, skipTaskbar: true, resizable: false, alwaysOnTop: true,
+      webPreferences: { backgroundThrottling: false },
+    });
+    curtainWin.setAlwaysOnTop(true, 'screen-saver'); // exe のウィンドウより上に出す
+    // クリックは幕で受け止める（閉めている間は、裏の表示用ウィンドウ・exe を誤って操作させない）
+    curtainWin.loadFile(path.join(__dirname, 'panel', 'curtain.html'), { query: { img: curtainImage() } });
+    return curtainWin;
+  }
+  function setCurtain(close) {
+    // 疑似表示ではモニターに出していないので使わない（画面を消すと同じ）
+    close = Boolean(close) && !virtual;
+    if (close === curtainClosed) return curtainClosed;
+    curtainClosed = close;
+    if (close) refocusOnCurtainOpen = focusBeforePanel() === 'display';
+    sendToPanel('display:curtain', close);
+    const win = curtainWindow();
+    curtainQueue = curtainQueue.then(async () => {
+      if (win.isDestroyed()) return;
+      if (win.webContents.isLoading()) await new Promise((r) => win.webContents.once('did-finish-load', r));
+      if (close) {
+        win.showInactive(); // パネルからフォーカスを奪わない
+        win.setBounds(bounds); // 複数モニターにまたがると作成時に OS 側でサイズが調整されることがある
+      }
+      await win.webContents.executeJavaScript(`curtain(${close})`).catch(logError);
+      // 開け終わったら隠す（透明でも最前面にあると負荷がかかる）。その間に閉め直されていたら隠さない
+      if (!close && !curtainClosed && !win.isDestroyed()) {
+        win.hide();
+        if (refocusOnCurtainOpen) focusFront();
+      }
+    });
+    return curtainClosed;
   }
 
   // 疑似表示 ⇔ 実表示 の切り替え（表示用ウィンドウを作り直し、同じ URL を読み込み直す）
@@ -551,7 +605,10 @@ app.whenReady().then(() => {
     previewTimer = null;
     if (alive()) display.destroy();
     virtual = next;
-    if (virtual) setBlackout(false);
+    if (virtual) {
+      setBlackout(false);
+      setCurtain(false);
+    }
     lastFrame = null;
     createDisplay(url);
     switching = false;
@@ -674,6 +731,7 @@ app.whenReady().then(() => {
       if (front) front.show();
       else if (alive() && displayReady && (!virtual || opts.auto)) display.setBounds(bounds); // 疑似表示はサイズだけ
       if (blackout) setBlackout(true);
+      if (curtainClosed && curtainWin && !curtainWin.isDestroyed()) curtainWin.setBounds(bounds);
       onBoundsChange();
     }, REPLACE_DELAY_MS);
   };
@@ -697,7 +755,10 @@ app.whenReady().then(() => {
         }
       }
     }
-    if (blackout && virtual) setBlackout(false);
+    if (virtual) {
+      if (blackout) setBlackout(false);
+      setCurtain(false);
+    }
     layoutNotes = layoutNotesFor(l);
     // パネルをプライマリに置き直す。既にプライマリで最大化されていれば触らない（最大化し直すとパネルが
     // アクティブになり、表示側からフォーカスを奪う。モニターが一瞬切れただけで発表者のキー操作が効かなくなる）
@@ -758,6 +819,7 @@ app.whenReady().then(() => {
     source: sourceId(),
     running: [...exes.keys()],
     blackout,
+    curtain: curtainClosed,
     focus,
     status,
     previewOn,
@@ -789,6 +851,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('panel:set-virtual', (_e, on) => setVirtual(Boolean(on)));
   ipcMain.handle('panel:set-blackout', (_e, on) => setBlackout(on));
+  ipcMain.handle('panel:set-curtain', (_e, close) => setCurtain(close));
   ipcMain.handle('panel:reload-list', () => loadUrlList());
   // ブラウザ表示の「戻る」「進む」「再読み込み」（exe を前に出している間も、裏のページに対して行う）
   //   ボタンを押すとパネルにフォーカスが移るので、押す前に表示側にあったら戻す

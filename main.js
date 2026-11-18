@@ -1,5 +1,5 @@
 // main.js
-const { app, BrowserWindow, dialog, screen, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, screen, ipcMain, powerSaveBlocker } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { parseArgs } = require('node:util');
@@ -15,12 +15,19 @@ const PREVIEW_INTERVAL_MS = 500; // プレビュー更新間隔
 const PREVIEW_WIDTH = 1280;      // プレビュー画像の幅（px）
 const INTERACTIVE_INTERVAL_MS = 100; // プレビュー上で操作中の更新間隔
 const INTERACTIVE_HOLD_MS = 2000;    // 最後の操作からこの時間は速い更新を続ける
+const RETRY_MS = 5000;         // 読み込みに失敗したとき、再試行するまでの時間
+const QUICK_CLOSE_MS = 3000;   // 表示してすぐにページがウィンドウを閉じたら、作り直さない（繰り返しを防ぐ）
+const REPLACE_DELAY_MS = 1000; // モニター構成が変わってから置き直すまでの時間（OS がウィンドウを動かし終えるのを待つ）
 
 // プレビューから転送を許可する入力イベント
 const INPUT_TYPES = new Set(['mouseDown', 'mouseUp', 'mouseMove', 'mouseWheel', 'keyDown', 'keyUp', 'char']);
 
 // 表示用ウィンドウが他のウィンドウに隠れていても描画を止めない（プレビュー用）
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+
+// 二重起動しない（同じ表示領域に 2 組のウィンドウが出る）。2 つ目は何もせず終了し、1 つ目のパネルを前に出す
+const firstInstance = app.requestSingleInstanceLock();
+if (!firstInstance) app.quit();
 
 // スキームが無ければ https:// を補う（例: example.com）。不正なら null
 function normalizeUrl(raw) {
@@ -129,6 +136,19 @@ function loadUrlList() {
   return { file, items, error: invalid.length ? `不正な行: ${invalid.join(', ')} 行目` : null };
 }
 
+// 想定外のエラーは url_list.txt と同じ場所の mywebview-error.log に記録する
+let logged = 0;
+function logError(e) {
+  console.error(e);
+  if (logged++ >= 100) return; // 同じエラーが繰り返されてもファイルを大きくしない（起動ごとに 100 件まで）
+  try {
+    fs.appendFileSync(path.join(path.dirname(findUrlListPath()), 'mywebview-error.log'),
+      `${new Date().toISOString()} ${e?.stack ?? e}\n`);
+  } catch {
+    // 書き込めない場所でも動き続ける
+  }
+}
+
 // 表示領域 b が接続中のモニターで完全に覆われているか
 function coveredByDisplays(b) {
   const covered = screen.getAllDisplays().reduce((sum, { bounds: a }) => {
@@ -160,6 +180,7 @@ function panelBoundsFor(displayBounds) {
 }
 
 app.whenReady().then(() => {
+  if (!firstInstance) return;
   let opts;
   try {
     opts = parseOptions();
@@ -188,6 +209,10 @@ app.whenReady().then(() => {
   let lastUrl = DEFAULTS.url; // 最後に表示した URL
   let status = '';          // パネルに出す状態メッセージ
   let quitting = false;
+  let retryTimer = null;    // 読み込み失敗後の再試行
+
+  // 操作せずに映し続けても、モニターのスリープ・スクリーンセーバーに入らせない
+  powerSaveBlocker.start('prevent-display-sleep');
 
   // ---- コントロールパネル ----
   const panel = new BrowserWindow({
@@ -197,6 +222,14 @@ app.whenReady().then(() => {
   });
   panel.removeMenu();
   panel.loadFile(path.join(__dirname, 'panel', 'index.html'));
+  // パネルにファイルやリンクを落としても、パネル自体を別のページに移動させない
+  panel.webContents.on('will-navigate', (e) => e.preventDefault());
+  // パネルが異常終了したら読み込み直す（状態は panel:init で復元される）
+  panel.webContents.on('render-process-gone', () => panel.reload());
+  app.on('second-instance', () => {
+    if (panel.isMinimized()) panel.restore();
+    panel.focus();
+  });
 
   const sendToPanel = (channel, ...args) => {
     if (!panel.isDestroyed()) panel.webContents.send(channel, ...args);
@@ -204,6 +237,15 @@ app.whenReady().then(() => {
   const alive = () => display && !display.isDestroyed();
   const currentTarget = () => (front ? front.text : alive() ? display.webContents.getURL() || lastUrl : '');
   const setStatus = (m) => { status = m; sendToPanel('display:status', m); };
+  // Web ページの状態。exe を前に出している間は、exe の状態表示を上書きしない
+  const setWebStatus = (m) => { if (!front) setStatus(m); };
+
+  // ここから先の想定外のエラーは、ダイアログを出さず（本番中に出ると操作を妨げる）記録して動き続ける
+  process.on('unhandledRejection', logError);
+  process.on('uncaughtException', (e) => {
+    logError(e);
+    setStatus(`内部エラー（mywebview-error.log に記録しました）: ${e?.message ?? e}`);
+  });
   const sendRunning = () => sendToPanel('display:running', [...exes.keys()]);
   // 前に出している exe のウィンドウのキャプチャ用 ID（desktopCapturer の DesktopCapturerSource.id と同じ形式）
   const sourceId = () => (front?.hwnd ? `window:${front.hwnd}:0` : null);
@@ -293,6 +335,8 @@ app.whenReady().then(() => {
     });
     display = win;
     displayReady = false;
+    const createdAt = Date.now();
+    let failed = false; // 読み込みに失敗して再試行中
     // オフスクリーンでも作成時は画面サイズに制限されるので、作成直後に指定サイズへ設定し直す
     if (virtual) win.setBounds(bounds);
 
@@ -317,8 +361,30 @@ app.whenReady().then(() => {
     });
     // target=_blank 等の新規ウィンドウは同じウィンドウで開く
     win.webContents.setWindowOpenHandler(({ url: u }) => {
-      win.loadURL(u);
+      win.loadURL(u).catch(() => {}); // 読み込み失敗は did-fail-load で扱う
       return { action: 'deny' };
+    });
+    // 編集中の確認（beforeunload）を出すページでも、パネルからの切り替えを止めさせない
+    win.webContents.on('will-prevent-unload', (e) => e.preventDefault());
+    // 読み込み失敗（ネットワークの切断等）は真っ白になるだけなので、パネルに出して、読み込めるまで再試行する
+    win.webContents.on('did-fail-load', (_e, code, desc, failedUrl, isMainFrame) => {
+      if (!isMainFrame || code === -3) return; // -3 (ERR_ABORTED): 別の URL への切り替え・ダウンロード等
+      failed = true;
+      setWebStatus(`読み込めません（${desc}）。${RETRY_MS / 1000} 秒ごとに再試行します: ${failedUrl}`);
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => {
+        // 失敗したページのままのときだけ（ページを表示したままの失敗（未対応のスキーム等）では再試行しない）
+        if (display === win && !win.isDestroyed() && win.webContents.getURL() === failedUrl) {
+          win.loadURL(failedUrl).catch(() => {});
+        }
+      }, RETRY_MS);
+    });
+    // ページの異常終了（メモリ不足等）は読み込み直す
+    win.webContents.on('render-process-gone', (_e, { reason }) => {
+      if (reason === 'clean-exit') return;
+      setWebStatus(`ページが異常終了したため、読み込み直しました（${reason}）`);
+      // 少し待つ（起動に失敗し続ける場合に、休みなく繰り返さない）
+      setTimeout(() => { if (!win.isDestroyed()) win.webContents.reload(); }, 1000);
     });
     // スクロールバーを非表示にする（表示されているとその幅だけページのレイアウト幅が狭くなるため）。
     // ホイール等でのスクロールはそのまま可能
@@ -330,6 +396,11 @@ app.whenReady().then(() => {
     });
     const onNavigate = () => sendToPanel('display:url', win.webContents.getURL());
     win.webContents.on('did-navigate', onNavigate);
+    // 読み込めた（失敗時は did-navigate が来ない）
+    win.webContents.on('did-navigate', () => {
+      if (failed) setWebStatus('');
+      failed = false;
+    });
     win.webContents.on('did-navigate-in-page', onNavigate);
     win.on('resize', onBoundsChange);
     win.on('move', onBoundsChange);
@@ -342,10 +413,21 @@ app.whenReady().then(() => {
       });
     }
 
-    // 表示用ウィンドウを閉じたらアプリを終了（モード切替での作り直しは除く）
-    win.on('closed', () => { if (!switching && display === win) app.quit(); });
+    // 表示用ウィンドウが閉じられたら（ページの window.close()・Alt+F4 等）、最後に選んだ URL で作り直す。
+    // アプリの終了はパネルから（モード切替での作り直し・終了時は除く）
+    win.on('closed', () => {
+      if (switching || quitting || display !== win) return;
+      display = null;
+      if (Date.now() - createdAt < QUICK_CLOSE_MS) {
+        setStatus('ページがすぐにウィンドウを閉じたため、表示をやめました');
+        sendToPanel('display:url', currentTarget());
+        return;
+      }
+      createDisplay(lastUrl);
+      setStatus('表示用ウィンドウが閉じられたため、表示し直しました');
+    });
 
-    win.loadURL(url).catch(() => {}); // 読み込み失敗はページ側に表示される
+    win.loadURL(url).catch(() => {}); // 読み込み失敗は did-fail-load で扱う
     setPreview(previewOn);
     onBoundsChange();
   }
@@ -450,7 +532,8 @@ app.whenReady().then(() => {
     if (!t) return `不正な URL です: ${raw}`;
     if (t.url) {
       lastUrl = t.url;
-      if (alive()) display.loadURL(t.url).catch(() => {}); // 読み込み失敗はページ側に表示される
+      clearTimeout(retryTimer); // 前の URL の再試行で、この切り替えを取り消さない
+      if (alive()) display.loadURL(t.url).catch(() => {}); // 読み込み失敗は did-fail-load で扱う
       else createDisplay(t.url);
       bringToFront(null);
       return null;
@@ -484,6 +567,20 @@ app.whenReady().then(() => {
     quitting = true;
     for (const exe of exes.values()) exe.close();
   });
+
+  // モニター構成の変化（ケーブルの抜き差し・モニターの電源・スリープ復帰等）で OS がウィンドウを動かすので、
+  // 落ち着いてから置き直す（背面のものは、前に出すときに置き直される）
+  let replaceTimer = null;
+  const replaceLater = () => {
+    clearTimeout(replaceTimer);
+    replaceTimer = setTimeout(() => {
+      if (front) front.show();
+      else if (alive() && !virtual && displayReady) display.setBounds(bounds);
+      if (blackout) setBlackout(true);
+      onBoundsChange();
+    }, REPLACE_DELAY_MS);
+  };
+  for (const ev of ['display-added', 'display-removed', 'display-metrics-changed']) screen.on(ev, replaceLater);
 
   // ---- パネルからの要求 ----
   ipcMain.handle('panel:init', () => ({
@@ -541,7 +638,16 @@ app.whenReady().then(() => {
     markInteractive();
   });
 
-  // パネルを閉じたらアプリを終了
+  // パネルを閉じたらアプリを終了（誤って閉じても本番が止まらないよう確認する）
+  panel.on('close', (e) => {
+    if (quitting) return;
+    const cancel = dialog.showMessageBoxSync(panel, {
+      type: 'question', buttons: ['終了する', 'キャンセル'], defaultId: 1, cancelId: 1,
+      message: 'mywebview を終了しますか？',
+      detail: exes.size ? '起動中のアプリも閉じます。' : '',
+    });
+    if (cancel) e.preventDefault();
+  });
   panel.on('closed', () => app.quit());
 });
 

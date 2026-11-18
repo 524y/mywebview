@@ -201,7 +201,12 @@ function launchExe({ file, args, text }, getRect, onChange) {
     if (!exited && Date.now() - searchSince < FALLBACK_MS) return 0;
     return wins.find((h) => {
       if (before.has(h)) return false;
-      const p = processInfo(pidOf(h));
+      const pid = pidOf(h);
+      // mywebview 自身が後から作ったウィンドウ（表示用ウィンドウ・画面を消す黒いウィンドウ）は使わない。
+      // 起動時に exe を指定すると mywebview も「起動後に始まったプロセス」に当てはまり、
+      // 拾うと表示用ウィンドウを exe として最小化・配置してしまう
+      if (pid === process.pid) return false;
+      const p = processInfo(pid);
       return p && (p.started >= launchedAt - 1000 || p.name === exeName);
     }) ?? 0;
   };

@@ -825,15 +825,22 @@ app.whenReady().then(() => {
   });
 
   // パネルを閉じたらアプリを終了（誤って閉じても本番が止まらないよう確認する）
+  //   確認を出している間も動き続ける（showMessageBoxSync は答えるまでメインプロセスを止めるので、出したまま
+  //   気づかないと、読み込みの再試行・表示用ウィンドウの作り直し・exe の配置・プレビューがすべて止まる）
+  let confirming = false;
   panel.on('close', (e) => {
     if (quitting) return;
-    const cancel = dialog.showMessageBoxSync(panel, {
+    e.preventDefault();
+    if (confirming) return;
+    confirming = true;
+    dialog.showMessageBox(panel, {
       // 'none': Windows はアイコンの種類に応じた音を鳴らすので、アイコンを出さない（本番中に音を出さない）
       type: 'none', buttons: ['終了する', 'キャンセル'], defaultId: 1, cancelId: 1,
       message: 'mywebview を終了しますか？',
       detail: exes.size ? '起動中のアプリも閉じます。' : '',
-    });
-    if (cancel) e.preventDefault();
+    }).then(({ response }) => {
+      if (response === 0) app.quit(); // before-quit で quitting になり、パネルも確認なしで閉じる
+    }).finally(() => { confirming = false; });
   });
   panel.on('closed', () => app.quit());
 });

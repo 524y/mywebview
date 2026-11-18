@@ -28,6 +28,11 @@ cp -r dist/win-unpacked "$STAGE/apps"
 sed 's/\r*$/\r/' url_list.txt > "$STAGE/url_list.txt"
 printf '@echo off\r\nstart "" "%%~dp0apps\\mywebview.exe" %%*\r\n' > "$STAGE/mywebview.bat"
 
-(cd "$STAGE" && zip -qr -9 "../$(basename "$ZIP")" url_list.txt mywebview.bat apps)
+if command -v zip >/dev/null 2>&1; then
+  (cd "$STAGE" && zip -qr -9 "../$(basename "$ZIP")" url_list.txt mywebview.bat apps)
+else
+  # Windows (Git Bash) 向け: zip が無ければ Windows 標準の bsdtar で ZIP を作る
+  (cd "$STAGE" && "$SYSTEMROOT/System32/tar.exe" -a -cf "../$(basename "$ZIP")" url_list.txt mywebview.bat apps)
+fi
 rm -rf "$STAGE"
 echo "created: $ZIP"

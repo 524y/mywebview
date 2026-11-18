@@ -241,10 +241,16 @@ app.whenReady().then(() => {
   // 前に出しているもの（リストで表示中にする）: exe の指定文字列 / 'web'（ブラウザ表示）/ ''（何も無い）
   const selectedKey = () => (front ? front.text : alive() ? 'web' : '');
   // ブラウザ表示の今の URL（exe を前に出している間も。リストのブラウザ表示の行に出す）
-  const webUrl = () => (alive() ? display.webContents.getURL() || lastUrl : '');
+  //   → { url, canGoBack, canGoForward } | null（ブラウザ表示が無い）
+  const webState = () => {
+    if (!alive()) return null;
+    const h = display.webContents.navigationHistory;
+    return { url: display.webContents.getURL() || lastUrl, canGoBack: h.canGoBack(), canGoForward: h.canGoForward() };
+  };
+  const sendWeb = () => sendToPanel('display:web', webState());
   const sendSelected = () => {
     sendToPanel('display:selected', selectedKey());
-    sendToPanel('display:web-url', webUrl());
+    sendWeb();
   };
   const setStatus = (m) => { status = m; sendToPanel('display:status', m); };
   // Web ページの状態。exe を前に出している間は、exe の状態表示を上書きしない
@@ -409,7 +415,7 @@ app.whenReady().then(() => {
     const onNavigate = () => {
       if (display !== win) return;
       if (!front) sendToPanel('display:url', win.webContents.getURL()); // exe を前に出している間は入力欄を変えない
-      sendToPanel('display:web-url', win.webContents.getURL());
+      sendWeb();
     };
     win.webContents.on('did-navigate', onNavigate);
     // 読み込めた（失敗時は did-navigate が来ない）
@@ -650,7 +656,7 @@ app.whenReady().then(() => {
   ipcMain.handle('panel:init', () => ({
     url: currentTarget(),
     selected: selectedKey(),
-    webUrl: webUrl(),
+    web: webState(),
     list: loadUrlList(),
     requested: bounds,
     bounds: currentBounds(),
@@ -690,6 +696,23 @@ app.whenReady().then(() => {
   ipcMain.handle('panel:set-virtual', (_e, on) => setVirtual(Boolean(on)));
   ipcMain.handle('panel:set-blackout', (_e, on) => setBlackout(on));
   ipcMain.handle('panel:reload-list', () => loadUrlList());
+  // ブラウザ表示の「戻る」「進む」「再読み込み」（exe を前に出している間も、裏のページに対して行う）
+  //   ボタンを押すとパネルにフォーカスが移るので、押す前に表示側にあったら戻す
+  const refocus = () => { if (focusBeforePanel() === 'display') focusFront(); };
+  ipcMain.handle('panel:web-back', () => {
+    if (alive() && display.webContents.navigationHistory.canGoBack()) display.webContents.navigationHistory.goBack();
+    refocus();
+  });
+  ipcMain.handle('panel:web-forward', () => {
+    if (alive() && display.webContents.navigationHistory.canGoForward()) display.webContents.navigationHistory.goForward();
+    refocus();
+  });
+  ipcMain.handle('panel:web-reload', () => {
+    if (!alive()) return;
+    clearTimeout(retryTimer); // 読み込み失敗後の再試行は、この再読み込みで置き換える
+    display.webContents.reload();
+    refocus();
+  });
 
   // プレビュー上の操作を表示用ウィンドウへ転送
   ipcMain.on('panel:input', (_e, ev) => {

@@ -21,7 +21,7 @@ function setCurrentUrl(url) {
 //   ブラウザ表示は 1 行にまとめ、今の URL を出す（地図等、操作で URL が変わっても追える）。
 //   その行を押すと読み込み直さずに戻る。URL の項目を押すと、その URL を読み込み直す
 let selected = '';        // 前に出しているもの: exe の指定文字列 / 'web' / ''
-let webUrl = '';          // ブラウザ表示の今の URL（無ければ ''）
+let web = null;           // ブラウザ表示の状態 { url, canGoBack, canGoForward }（無ければ null）
 let focusWhere = 'other'; // 'display' | 'panel' | 'other'
 function markList() {
   for (const b of listEl.querySelectorAll('button.item')) {
@@ -31,12 +31,22 @@ function markList() {
 }
 window.api.onSelected((key) => { selected = key; markList(); });
 window.api.onFocus((where) => { focusWhere = where; markList(); });
-window.api.onWebUrl((url) => {
-  const had = Boolean(webUrl);
-  webUrl = url;
-  if (had !== Boolean(url)) renderList(); // 行を出す・消す
-  else { const u = listEl.querySelector('.web .u'); if (u) { u.textContent = url; u.title = url; } }
+window.api.onWeb((next) => {
+  const had = Boolean(web);
+  web = next;
+  if (had !== Boolean(next)) renderList(); // 行を出す・消す
+  else updateWebRow();
 });
+// ブラウザ表示の行の URL・「戻る」「進む」ボタンだけを更新する（地図の操作等で頻繁に来るので、リスト全体は作り直さない）
+function updateWebRow() {
+  const li = listEl.querySelector('li.web');
+  if (!li || !web) return;
+  const u = li.querySelector('.u');
+  u.textContent = web.url;
+  u.title = web.url;
+  li.querySelector('.back').disabled = !web.canGoBack;
+  li.querySelector('.forward').disabled = !web.canGoForward;
+}
 const sameUrl = (a, b) => a.replace(/\/$/, '') === b.replace(/\/$/, '');
 
 async function navigate(url) {
@@ -89,10 +99,22 @@ function renderList(data = listData) {
   $('#list-path').title = file;
   $('#list-error').textContent = error ?? (items.length ? '' : 'URL が登録されていません');
   const rows = [];
-  if (webUrl) {
-    const li = listItem({ name: 'ブラウザ表示', url: webUrl, key: 'web', onClick: showWeb });
+  if (web) {
+    const li = listItem({ name: 'ブラウザ表示', url: web.url, key: 'web', onClick: showWeb });
     li.classList.add('web');
     li.querySelector('.item').title = '今のページのまま前に出します（読み込み直しません）';
+    const navBtn = (cls, text, title, fn) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = `btn close ${cls}`;
+      b.textContent = text;
+      b.title = title;
+      b.addEventListener('click', fn);
+      li.append(b);
+    };
+    navBtn('back', '← 戻る', '1 つ前のページに戻ります', () => window.api.webBack());
+    navBtn('forward', '進む →', '戻る前のページに進みます', () => window.api.webForward());
+    navBtn('reload', '⟳ 再読込', 'ページを読み込み直します', () => window.api.webReload());
     rows.push(li);
   }
   // url_list.txt に無い起動中の exe（入力欄から起動したもの）も出して、戻ったり終了したりできるようにする
@@ -119,6 +141,7 @@ function renderList(data = listData) {
     rows.push(li);
   }
   listEl.replaceChildren(...rows);
+  updateWebRow();
   markList();
 }
 $('#list-reload').addEventListener('click', async () => renderList(await window.api.reloadList()));
@@ -378,7 +401,7 @@ window.api.onBounds(setupPreview);
   running = s.running;
   focusWhere = s.focus;
   selected = s.selected;
-  webUrl = s.webUrl;
+  web = s.web;
   renderList(s.list);
   setCurrentUrl(s.url);
   setupPreview(s.bounds);

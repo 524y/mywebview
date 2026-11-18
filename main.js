@@ -740,7 +740,8 @@ app.whenReady().then(() => {
   panel.on('close', (e) => {
     if (quitting) return;
     const cancel = dialog.showMessageBoxSync(panel, {
-      type: 'question', buttons: ['終了する', 'キャンセル'], defaultId: 1, cancelId: 1,
+      // 'none': Windows はアイコンの種類に応じた音を鳴らすので、アイコンを出さない（本番中に音を出さない）
+      type: 'none', buttons: ['終了する', 'キャンセル'], defaultId: 1, cancelId: 1,
       message: 'mywebview を終了しますか？',
       detail: exes.size ? '起動中のアプリも閉じます。' : '',
     });

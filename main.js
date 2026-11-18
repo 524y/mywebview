@@ -3,6 +3,7 @@ const { app, BrowserWindow, dialog, screen, ipcMain } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { parseArgs } = require('node:util');
+const { parseExe, launchExe } = require('./exe');
 
 const DEFAULTS = {
   url: 'https://www.google.com/',
@@ -33,9 +34,18 @@ function normalizeUrl(raw) {
   }
 }
 
+// 表示対象（URL または exe）の文字列を解析する。exe の相対パスは url_list.txt のある場所が基準
+//   → { exe: { file, args, text } } | { url } | null
+function parseTarget(raw) {
+  const exe = parseExe(raw, path.dirname(findUrlListPath()));
+  if (exe) return { exe };
+  const url = normalizeUrl(raw);
+  return url ? { url } : null;
+}
+
 // 引数を解析する
-//   開発時:       electron . [URL] [--x N] [--y N] [--w N] [--h N] [--virtual | --real] [--debug]
-//   パッケージ後: mywebview [URL] [--x N] [--y N] [--w N] [--h N] [--virtual | --real] [--debug]
+//   開発時:       electron . [URL|EXE] [--x N] [--y N] [--w N] [--h N] [--virtual | --real] [--debug]
+//   パッケージ後: mywebview [URL|EXE] [--x N] [--y N] [--w N] [--h N] [--virtual | --real] [--debug]
 //   --virtual: 疑似表示（画面に出さずプレビューのみ） / --real: 実表示（モニターに収まらなくても表示）
 //   どちらも無ければ、表示領域がモニターに収まらないときに疑似表示
 function parseOptions() {
@@ -69,12 +79,11 @@ function parseOptions() {
     throw new Error('--virtual と --real は同時に指定できません');
   }
 
-  const rawUrl = positionals[0] ?? DEFAULTS.url;
-  const url = normalizeUrl(rawUrl);
-  if (!url) throw new Error(`不正な URL です: ${rawUrl}`);
+  const raw = positionals[0] ?? DEFAULTS.url;
+  if (!parseTarget(raw)) throw new Error(`不正な URL です: ${raw}`);
 
   return {
-    url,
+    target: raw,
     x:      toInt('x', values.x, DEFAULTS.x, -Infinity),
     y:      toInt('y', values.y, DEFAULTS.y, -Infinity),
     width:  toInt('w', values.w ?? values.width, DEFAULTS.width, 1),
@@ -96,7 +105,7 @@ function findUrlListPath() {
   return candidates.find((p) => fs.existsSync(p)) ?? candidates[0];
 }
 
-// 1 行 1 件:「表示名, URL」または「URL」。空行と # で始まる行は無視
+// 1 行 1 件:「表示名, URL」または「URL」（URL の代わりに exe も可）。空行と # で始まる行は無視
 function loadUrlList() {
   const file = findUrlListPath();
   let text;
@@ -112,7 +121,8 @@ function loadUrlList() {
     if (!s || s.startsWith('#')) return;
     const comma = s.indexOf(',');
     const name = comma >= 0 ? s.slice(0, comma).trim() : s;
-    const url = normalizeUrl(comma >= 0 ? s.slice(comma + 1) : s);
+    const t = parseTarget(comma >= 0 ? s.slice(comma + 1) : s);
+    const url = t?.exe?.text ?? t?.url;
     if (url) items.push({ name: name || url, url });
     else invalid.push(i + 1);
   });
@@ -169,8 +179,15 @@ app.whenReady().then(() => {
   // 指定が無ければ、表示領域が接続中のモニターに収まらない（外部モニターが無い等）ときに疑似表示
   let virtual = opts.virtual ? true : opts.real ? false : !coveredByDisplays(bounds);
 
-  let display = null;      // 表示用ウィンドウ（モード切替で作り直す）
-  let switching = false;   // 作り直し中は「閉じたら終了」を無効にする
+  let display = null;       // 表示用ウィンドウ（Web ページ。モード切替で作り直す。exe を前に出している間は隠す）
+  let displayReady = false; // 表示用ウィンドウの最初の描画が済んだか（済む前に出すと白い画面が見える）
+  let switching = false;    // 作り直し中は「閉じたら終了」を無効にする
+  const exes = new Map();   // 起動中の exe（キー: exe の指定文字列 → launchExe() の戻り値）
+  let front = null;         // 前に出している exe（null なら Web ページ）
+  let history = [];         // 前に出した順（後ろほど新しい）。exe か 'web'。exe を閉じたときに 1 つ前に戻すのに使う
+  let lastUrl = DEFAULTS.url; // 最後に表示した URL
+  let status = '';          // パネルに出す状態メッセージ
+  let quitting = false;
 
   // ---- コントロールパネル ----
   const panel = new BrowserWindow({
@@ -185,15 +202,27 @@ app.whenReady().then(() => {
     if (!panel.isDestroyed()) panel.webContents.send(channel, ...args);
   };
   const alive = () => display && !display.isDestroyed();
+  const currentTarget = () => (front ? front.text : alive() ? display.webContents.getURL() || lastUrl : '');
+  const setStatus = (m) => { status = m; sendToPanel('display:status', m); };
+  const sendRunning = () => sendToPanel('display:running', [...exes.keys()]);
+  // 前に出している exe のウィンドウのキャプチャ用 ID（desktopCapturer の DesktopCapturerSource.id と同じ形式）
+  const sourceId = () => (front?.hwnd ? `window:${front.hwnd}:0` : null);
+  // exe は疑似表示できない（他のプロセスのウィンドウは画面外に描画させられない）ので、常に実表示
+  const exeNote = () => (coveredByDisplays(bounds) ? '' : '表示領域がモニターに収まらないため、正しく表示されない場合があります');
 
   // プレビューの縦横比・区切り位置は「実際の」ウィンドウサイズに合わせる
   // （OS 側でサイズが制限されると指定値と異なることがある）
-  const currentBounds = () => (virtual
-    ? { ...bounds, virtual: true }
-    : { ...display.getContentBounds(), virtual: false });
-  const onBoundsChange = () => {
-    if (alive()) sendToPanel('display:bounds', currentBounds());
+  const currentBounds = () => {
+    if (front) {
+      const r = front.rect(); // 物理ピクセル
+      return { ...(r ? screen.screenToDipRect(null, r) : bounds), virtual: false, exe: true };
+    }
+    // 表示用ウィンドウが無いとき（exe で起動して、それを閉じた後等）は指定値
+    return virtual || !alive()
+      ? { ...bounds, virtual }
+      : { ...display.getContentBounds(), virtual: false };
   };
+  const onBoundsChange = () => sendToPanel('display:bounds', currentBounds());
 
   // ---- プレビュー ----
   let lastFrame = null; // パネルの読み込み前に描画された分を初期表示に使う
@@ -205,7 +234,9 @@ app.whenReady().then(() => {
 
   let previewTimer = null;
   let capturing = false;
-  let previewOn = true;
+  // モニターに表示している（実表示で表示領域がモニターに収まる）ときは、起動時はプレビュー OFF（負荷を減らす）。
+  // 疑似表示ではプレビューでしか見えないので ON
+  let previewOn = virtual || !coveredByDisplays(bounds);
 
   // プレビュー上で操作している間は、一時的に更新間隔を短くする
   let interactive = false;
@@ -227,6 +258,7 @@ app.whenReady().then(() => {
     clearInterval(previewTimer);
     previewTimer = null;
     if (!alive()) return;
+    on = on && !front; // exe を前に出している間は、パネル側で exe のウィンドウを動画でキャプチャする
     if (virtual) {
       // オフスクリーン描画: 内容が変わったときだけ paint が来る。プレビュー OFF 中は描画自体を止める
       if (on) {
@@ -260,13 +292,15 @@ app.whenReady().then(() => {
       webPreferences: { backgroundThrottling: false, offscreen: virtual },
     });
     display = win;
+    displayReady = false;
     // オフスクリーンでも作成時は画面サイズに制限されるので、作成直後に指定サイズへ設定し直す
     if (virtual) win.setBounds(bounds);
 
     // 複数モニターにまたがる場合、作成時に OS 側でサイズが調整されることがあるので、
     // 表示後にもう一度位置とサイズを設定する
     win.once('ready-to-show', () => {
-      if (!virtual) {
+      if (display === win) displayReady = true;
+      if (!virtual && !front) { // exe を前に出していたら、Web ページに切り替えたときに出す
         win.showInactive(); // パネルからフォーカスを奪わない
         win.setBounds(bounds);
       }
@@ -316,38 +350,165 @@ app.whenReady().then(() => {
     onBoundsChange();
   }
 
+  // ---- 画面を消す（表示領域を最前面の黒いウィンドウで覆う。Web ページ・exe のどちらの上にも出る） ----
+  // プレビューには裏の実際の内容が映り続ける（消している間に次の準備ができる）
+  let blackout = false;
+  let blackWin = null;
+  function setBlackout(on) {
+    // 疑似表示ではモニターに出していない（表示領域がパネルのモニターに重なることもある）ので使わない
+    blackout = Boolean(on) && !virtual;
+    if (blackout) {
+      if (!blackWin || blackWin.isDestroyed()) {
+        blackWin = new BrowserWindow({
+          ...bounds, frame: false, show: false, backgroundColor: '#000000', hasShadow: false,
+          focusable: false, skipTaskbar: true, resizable: false, alwaysOnTop: true,
+        });
+        blackWin.setAlwaysOnTop(true, 'screen-saver'); // exe のウィンドウより上に出す
+        blackWin.loadURL(`data:text/html,${encodeURIComponent('<html style="background:#000;cursor:none"></html>')}`);
+      }
+      blackWin.showInactive(); // パネルからフォーカスを奪わない
+      blackWin.setBounds(bounds); // 複数モニターにまたがると作成時に OS 側でサイズが調整されることがある
+    } else if (blackWin && !blackWin.isDestroyed()) {
+      blackWin.hide();
+    }
+    sendToPanel('display:blackout', blackout);
+    return blackout;
+  }
+
   // 疑似表示 ⇔ 実表示 の切り替え（表示用ウィンドウを作り直し、同じ URL を読み込み直す）
   function setVirtual(next) {
-    if (next === virtual) return virtual;
-    const url = (alive() && display.webContents.getURL()) || opts.url;
+    if (front || next === virtual) return virtual; // exe は常に実表示
+    const url = (alive() && display.webContents.getURL()) || lastUrl;
     switching = true;
     clearInterval(previewTimer);
     previewTimer = null;
     if (alive()) display.destroy();
     virtual = next;
+    if (virtual) setBlackout(false);
     lastFrame = null;
     createDisplay(url);
     switching = false;
     return virtual;
   }
 
-  createDisplay(opts.url);
+  // ---- 表示の切り替え ----
+  // 前に出すものを切り替える（next: exe か null = Web ページ）。前に出ていたものは隠す（exe は最小化）
+  function bringToFront(next) {
+    const prev = front;
+    front = next;
+    history = history.filter((v) => v !== (next ?? 'web'));
+    history.push(next ?? 'web');
+    // 先に出してから隠す（逆だと一瞬デスクトップが見える）
+    if (next) {
+      next.show();
+      if (alive() && !virtual) display.hide();
+    } else if (alive() && !virtual && displayReady) { // 最初の描画前なら ready-to-show で出る
+      display.showInactive(); // パネルからフォーカスを奪わない
+      display.setBounds(bounds);
+      display.moveTop();
+    }
+    if (prev && prev !== next) prev.hide();
+    setPreview(previewOn);
+    sendToPanel('preview:source', sourceId());
+    sendToPanel('display:url', currentTarget());
+    onBoundsChange();
+    setStatus(next ? exeNote() : '');
+  }
+
+  // exe の状態が変わった（launchExe() の onChange）
+  function onExeChange(exe, message) {
+    if (quitting) return;
+    if (exe.ended) {
+      if (exes.get(exe.text) === exe) exes.delete(exe.text);
+      history = history.filter((v) => v !== exe);
+      if (front === exe) {
+        front = null; // 終了した exe を隠そうとしないよう、先に外す
+        // 1 つ前に表示していたものに戻す。無ければ何も表示しない
+        const prev = history.at(-1);
+        if (prev) {
+          bringToFront(prev === 'web' ? null : prev);
+        } else {
+          sendToPanel('preview:source', null);
+          sendToPanel('display:url', currentTarget());
+          onBoundsChange();
+        }
+      }
+      sendRunning();
+      if (message) setStatus(`${exe.name}: ${message}`);
+      return;
+    }
+    if (exe !== front) return; // 背面の exe の変化（ウィンドウが見つかった等）はパネルに出さない
+    sendToPanel('preview:source', sourceId());
+    onBoundsChange();
+    if (message !== undefined) setStatus([message, exeNote()].filter(Boolean).join('　'));
+  }
+
+  // 表示対象（URL または exe）を切り替える。エラーならメッセージを返す
+  //   exe は起動中ならそのまま前に出し、前に出ていた exe は閉じずに最小化しておく
+  function show(raw) {
+    const t = parseTarget(raw);
+    if (!t) return `不正な URL です: ${raw}`;
+    if (t.url) {
+      lastUrl = t.url;
+      if (alive()) display.loadURL(t.url).catch(() => {}); // 読み込み失敗はページ側に表示される
+      else createDisplay(t.url);
+      bringToFront(null);
+      return null;
+    }
+    if (process.platform !== 'win32') return 'exe の表示は Windows のみ対応しています';
+    let exe = exes.get(t.exe.text);
+    const isNew = !exe;
+    if (isNew) {
+      try {
+        exe = launchExe(t.exe, () => screen.dipToScreenRect(null, bounds), (m) => onExeChange(exe, m));
+      } catch (e) {
+        return `exe を起動できません: ${e.message}`;
+      }
+      exes.set(t.exe.text, exe);
+      sendRunning();
+    }
+    bringToFront(exe);
+    if (isNew) setStatus(['起動中…', exeNote()].filter(Boolean).join('　'));
+    return null;
+  }
+
+  const startError = show(opts.target);
+  if (startError) {
+    console.error(startError);
+    dialog.showErrorBox('mywebview', startError);
+    app.exit(1);
+    return;
+  }
+  // mywebview を終了するときは、起動中の exe をすべて閉じる
+  app.on('before-quit', () => {
+    quitting = true;
+    for (const exe of exes.values()) exe.close();
+  });
 
   // ---- パネルからの要求 ----
   ipcMain.handle('panel:init', () => ({
-    url: (alive() && display.webContents.getURL()) || opts.url,
+    url: currentTarget(),
     list: loadUrlList(),
     requested: bounds,
     bounds: currentBounds(),
     frame: lastFrame,
+    source: sourceId(),
+    running: [...exes.keys()],
+    blackout,
+    status,
     previewOn,
     virtual,
   }));
-  ipcMain.handle('panel:navigate', (_e, raw) => {
-    const url = normalizeUrl(raw);
-    if (!url) return `不正な URL です: ${raw}`;
-    if (alive()) display.loadURL(url).catch(() => {}); // 読み込み失敗はページ側に表示される
-    return null;
+  ipcMain.handle('panel:navigate', (_e, raw) => show(raw));
+  // exe を閉じる（text 省略時は前に出ている exe）。exe は枠を消しているので閉じるボタンが無い
+  ipcMain.handle('panel:close-exe', (_e, text) => {
+    const exe = text ? exes.get(text) : front;
+    if (!exe) return;
+    exe.close(); // すぐに閉じれば、onExeChange() で一覧から消えて 1 つ前の表示に戻る
+    if (!exe.ended) {
+      setStatus(`${exe.name}: 終了を指示しました` +
+        (exe === front ? '' : '（保存の確認などが出ている場合は、前に出して操作してください）'));
+    }
   });
   ipcMain.handle('panel:set-preview', (_e, on) => {
     previewOn = Boolean(on);
@@ -355,11 +516,18 @@ app.whenReady().then(() => {
     return previewOn;
   });
   ipcMain.handle('panel:set-virtual', (_e, on) => setVirtual(Boolean(on)));
+  ipcMain.handle('panel:set-blackout', (_e, on) => setBlackout(on));
   ipcMain.handle('panel:reload-list', () => loadUrlList());
 
   // プレビュー上の操作を表示用ウィンドウへ転送
   ipcMain.on('panel:input', (_e, ev) => {
-    if (!alive() || !ev || !INPUT_TYPES.has(ev.type)) return;
+    if (!ev || !INPUT_TYPES.has(ev.type)) return;
+    if (front) {
+      const b = currentBounds();
+      front.mouse(ev, ev.x / b.width, ev.y / b.height);
+      return;
+    }
+    if (!alive()) return;
     if (ev.type === 'mouseDown' || ev.type === 'keyDown') {
       if (!display.webContents.isFocused()) display.webContents.focus();
     }
@@ -368,7 +536,7 @@ app.whenReady().then(() => {
   });
   // IME で確定した文字列（日本語入力など）
   ipcMain.on('panel:insert-text', (_e, text) => {
-    if (!alive() || typeof text !== 'string' || !text) return;
+    if (front || !alive() || typeof text !== 'string' || !text) return;
     display.webContents.insertText(text);
     markInteractive();
   });

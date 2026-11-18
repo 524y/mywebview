@@ -41,6 +41,8 @@
   }
   .btn:hover { border-color: var(--accent); }
   .btn.on { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  #blackout.active { background: var(--error); border-color: var(--error); color: #fff; font-weight: 600; }
   #msg { min-height: 1.5em; margin-top: -8px; font-size: 12px; color: var(--error); }
 
   /* 中段: URL リスト */
@@ -51,13 +53,19 @@
     flex: 1; min-height: 80px; overflow-y: auto; margin: -6px 0 0; padding: 0; list-style: none;
     display: flex; flex-direction: column; gap: 4px;
   }
-  #list button {
-    width: 100%; text-align: left; padding: 7px 12px; border: 1px solid var(--line);
+  #list li { display: flex; gap: 6px; }
+  #list .item {
+    flex: 1; min-width: 0; text-align: left; padding: 7px 12px; border: 1px solid var(--line);
     border-radius: 6px; background: var(--card); cursor: pointer;
     display: flex; gap: 12px; align-items: baseline;
   }
-  #list button:hover { border-color: var(--accent); }
-  #list button.current { background: var(--accent-bg); border-color: var(--accent); }
+  #list .item:hover { border-color: var(--accent); }
+  #list .item.current { background: var(--accent-bg); border-color: var(--accent); }
+  #list .badge {
+    font-size: 11px; padding: 0 6px; border-radius: 3px; white-space: nowrap;
+    color: var(--accent); border: 1px solid var(--accent);
+  }
+  #list .close { padding: 2px 12px; font-size: 12px; }
   #list .name { font-weight: 600; white-space: nowrap; }
   #list .u { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #list-error { font-size: 12px; color: var(--error); }
@@ -72,10 +80,11 @@
     overflow: hidden;
   }
   #frame:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
-  #frame img {
+  #frame img, #frame video {
     position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; display: block;
     user-select: none;
   }
+  #frame [hidden] { display: none; }
   /* キー入力（IME 含む）を受けるための見えない入力欄 */
   #kbd {
     position: absolute; left: 0; top: 0; width: 1px; height: 1px; padding: 0; border: 0;
@@ -84,6 +93,12 @@
   #frame .split {
     position: absolute; top: 0; bottom: 0; width: 0; margin-left: -1px;
     border-left: 2px dashed var(--marker); opacity: .85; pointer-events: none;
+  }
+  /* 画面を消している間は、プレビューの上に表示する（プレビューには裏の内容が映っている） */
+  #frame.blackout::after {
+    content: '画面消去中（モニターは黒）'; position: absolute; left: 50%; top: 50%;
+    transform: translate(-50%, -50%); padding: 4px 12px; border-radius: 4px;
+    background: rgba(0,0,0,.75); color: #fff; font-weight: 600; pointer-events: none;
   }
   #frame .label {
     position: absolute; top: 4px; padding: 0 6px; font-size: 11px; line-height: 18px;
@@ -94,10 +109,12 @@
 </head>
 <body>
   <form id="bar">
-    <input id="url" type="text" spellcheck="false" autocomplete="off" placeholder="URL を入力して Enter">
+    <input id="url" type="text" spellcheck="false" autocomplete="off" placeholder="URL または exe のパスを入力して Enter">
+    <button id="exe-close" type="button" class="btn" hidden title="表示中の exe を閉じます">アプリを終了</button>
     <button id="mode-toggle" type="button" class="btn"
             title="疑似表示: モニターには出さずプレビューのみ / 実表示: モニターに表示">表示モード</button>
     <button id="preview-toggle" type="button" class="btn">プレビュー</button>
+    <button id="blackout" type="button" class="btn" title="表示領域（モニター）を真っ黒にします">画面を消す</button>
   </form>
   <div id="msg"></div>
 
@@ -117,6 +134,7 @@
     <div class="ruler" id="ruler-top"></div>
     <div id="frame" title="クリックで操作（キー入力もページに送られます）">
       <img id="preview-img" alt="" draggable="false">
+      <video id="preview-video" autoplay muted hidden></video>
       <textarea id="kbd" aria-label="キー入力" spellcheck="false" autocomplete="off"></textarea>
     </div>
     <div class="ruler" id="ruler-bottom"></div>

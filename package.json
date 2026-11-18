@@ -1,18 +1,32 @@
 {
   "name": "mywebview",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "プレゼン用 webview",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node --test",
     "dist:win": "electron-builder --win dir --x64 && sh scripts/package-win.sh"
   },
   "build": {
     "appId": "jp.local.mywebview",
     "productName": "mywebview",
-    "files": ["main.js", "preload.js", "panel/**", "package.json"],
-    "directories": { "output": "dist" },
-    "win": { "target": "dir" }
+    "files": [
+      "main.js",
+      "exe.js",
+      "preload.js",
+      "panel/**",
+      "package.json",
+      "!node_modules/@koromix/**",
+      "!node_modules/koffi/{doc,lib,vendor}/**",
+      "!node_modules/koffi/src/koffi/src/**/*.{cc,hh,inc,S,asm,def}"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": "dir"
+    }
   },
   "keywords": [],
   "author": "KONISHI Yasuhiro",
@@ -21,5 +35,8 @@
   "devDependencies": {
     "electron": "^45.3.2",
     "electron-builder": "^26.18.0"
+  },
+  "dependencies": {
+    "koffi": "^3.3.8"
   }
 }

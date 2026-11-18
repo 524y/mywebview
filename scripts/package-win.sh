@@ -12,7 +12,16 @@ STAGE=dist/zip-staging
 ZIP="dist/mywebview-${VERSION}-win.zip"
 
 rm -rf "$STAGE" "$ZIP"
-mkdir -p "$STAGE"
+
+# koffi（exe 表示用）の Windows 用バイナリ。npm install ではビルドしている OS の分しか入らないので取ってくる。
+# koffi は <resources>/koffi/win32_x64/koffi.node も探す
+KOFFI_VERSION=$(node -p "require('./package-lock.json').packages['node_modules/koffi'].version")
+mkdir -p "$STAGE/koffi"
+(cd "$STAGE/koffi" && npm pack --silent "@koromix/koffi-win32-x64@$KOFFI_VERSION" >/dev/null && tar xzf ./*.tgz)
+mkdir -p dist/win-unpacked/resources/koffi/win32_x64
+cp "$STAGE/koffi/package/win32_x64/koffi.node" dist/win-unpacked/resources/koffi/win32_x64/
+rm -rf "$STAGE/koffi"
+
 cp -r dist/win-unpacked "$STAGE/apps"
 
 # Windows 向けに改行を CRLF にする

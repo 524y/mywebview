@@ -6,6 +6,7 @@ const listEl = $('#list');
 const previewBtn = $('#preview-toggle');
 const previewWrap = $('#preview-wrap');
 const img = $('#preview-img');
+const video = $('#preview-video'); // exe 表示中のプレビュー（ウィンドウのキャプチャ）
 
 let currentUrl = '';
 let previewOn = true;
@@ -14,15 +15,16 @@ let previewOn = true;
 function setCurrentUrl(url) {
   currentUrl = url;
   if (document.activeElement !== urlInput) urlInput.value = url; // 入力中は上書きしない
-  for (const b of listEl.querySelectorAll('button')) {
+  for (const b of listEl.querySelectorAll('button.item')) {
     b.classList.toggle('current', sameUrl(b.dataset.url, url));
   }
 }
 const sameUrl = (a, b) => a.replace(/\/$/, '') === b.replace(/\/$/, '');
 
 async function navigate(url) {
+  msg.textContent = ''; // exe の状態メッセージは応答より先に届くので、応答後には消さない
   const err = await window.api.navigate(url);
-  msg.textContent = err ?? '';
+  if (err) msg.textContent = err;
 }
 
 $('#bar').addEventListener('submit', (e) => {
@@ -36,25 +38,47 @@ urlInput.addEventListener('keydown', (e) => {
 urlInput.addEventListener('focus', () => urlInput.select());
 
 // ---- URL リスト ----
-function renderList({ file, items, error }) {
+let listData = { file: '', items: [], error: null };
+let running = []; // 起動中の exe（指定文字列）
+function renderList(data = listData) {
+  listData = data;
+  const { file, items, error } = data;
   $('#list-path').textContent = file;
   $('#list-path').title = file;
   $('#list-error').textContent = error ?? (items.length ? '' : 'URL が登録されていません');
-  listEl.replaceChildren(...items.map(({ name, url }) => {
+  // url_list.txt に無い起動中の exe（入力欄から起動したもの）も出して、終了できるようにする
+  const extra = running.filter((r) => !items.some((it) => it.url === r))
+    .map((r) => ({ name: r.split('\\').pop(), url: r }));
+  listEl.replaceChildren(...[...items, ...extra].map(({ name, url }) => {
     const li = document.createElement('li');
     const b = document.createElement('button');
     b.type = 'button';
+    b.className = 'item';
     b.dataset.url = url;
     b.innerHTML = '<span class="name"></span><span class="u"></span>';
     b.querySelector('.name').textContent = name;
     b.querySelector('.u').textContent = url;
     b.addEventListener('click', () => navigate(url));
     li.append(b);
+    if (running.includes(url)) {
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = '起動中';
+      b.querySelector('.name').after(badge);
+      const c = document.createElement('button');
+      c.type = 'button';
+      c.className = 'btn close';
+      c.textContent = '終了';
+      c.title = 'このアプリを閉じます';
+      c.addEventListener('click', () => window.api.closeExe(url));
+      li.append(c);
+    }
     return li;
   }));
   setCurrentUrl(currentUrl);
 }
 $('#list-reload').addEventListener('click', async () => renderList(await window.api.reloadList()));
+window.api.onRunning((list) => { running = list; renderList(); });
 
 // ---- プレビュー ----
 // 表示領域を 16:9 ごとに区切った位置（0〜1）を返す。48:9 なら [1/3, 2/3]
@@ -71,6 +95,14 @@ let displaySize = { width: 1, height: 1 }; // 表示領域の実サイズ（操�
 function setupPreview(bounds) {
   displaySize = { width: bounds.width, height: bounds.height };
   if (typeof bounds.virtual === 'boolean') setModeState(bounds.virtual);
+  const exe = Boolean(bounds.exe);
+  modeBtn.disabled = exe; // exe は常に実表示
+  $('#exe-close').hidden = !exe;
+  img.hidden = exe;
+  video.hidden = !exe;
+  $('#frame').title = exe
+    ? 'クリックで操作（exe がアクティブになり、キー入力は exe が直接受け取ります）'
+    : 'クリックで操作（キー入力もページに送られます）';
   const pts = splitPoints(bounds);
   const n = pts.length + 1;
   $('#frame').style.aspectRatio = `${bounds.width} / ${bounds.height}`;
@@ -79,6 +111,7 @@ function setupPreview(bounds) {
   $('#preview-info').textContent =
     `表示領域 ${bounds.width}×${bounds.height}（位置 ${bounds.x}, ${bounds.y}） — 16:9 × ${screens} 画面分` +
     (bounds.virtual ? '　※ 疑似表示（モニターには表示していません）' : '') +
+    (exe ? '　※ exe 表示中（マウス操作はアプリによって効かないことがあります）' : '') +
     (differs ? `　※ 指定 ${requested.width}×${requested.height} から OS により変更されています` : '');
 
   const mark = (pos) => { const i = document.createElement('i'); i.style.left = `${pos * 100}%`; return i; };
@@ -109,6 +142,7 @@ function setPreviewState(on) {
   previewBtn.classList.toggle('on', on);
   previewBtn.textContent = on ? 'プレビュー ON' : 'プレビュー OFF';
   previewWrap.hidden = !on;
+  updateVideo();
 }
 previewBtn.addEventListener('click', async () => setPreviewState(await window.api.setPreview(!previewOn)));
 
@@ -119,11 +153,27 @@ function setModeState(v) {
   virtualMode = v;
   modeBtn.textContent = v ? '疑似表示' : '実表示';
   modeBtn.classList.toggle('on', !v);
+  blackoutBtn.disabled = v; // 疑似表示ではモニターに出していない
+  blackoutBtn.title = v ? '疑似表示中は使えません' : '表示領域（モニター）を真っ黒にします';
 }
+
+// ---- 画面を消す ----
+const blackoutBtn = $('#blackout');
+let blackout = false;
+function setBlackoutState(on) {
+  blackout = on;
+  blackoutBtn.classList.toggle('active', on);
+  blackoutBtn.textContent = on ? '画面を戻す' : '画面を消す';
+  $('#frame').classList.toggle('blackout', on);
+}
+blackoutBtn.addEventListener('click', async () => setBlackoutState(await window.api.setBlackout(!blackout)));
+window.api.onBlackout(setBlackoutState);
 modeBtn.addEventListener('click', async () => {
   modeBtn.disabled = true;
   try {
     setModeState(await window.api.setVirtual(!virtualMode));
+    // 疑似表示はプレビューでしか見えないので、OFF なら ON にする
+    if (virtualMode && !previewOn) setPreviewState(await window.api.setPreview(true));
   } finally {
     modeBtn.disabled = false;
   }
@@ -139,6 +189,39 @@ function showFrame(jpeg) {
   img.src = objUrl;
 }
 window.api.onFrame(showFrame);
+
+// exe のウィンドウをキャプチャして動画で表示する（プレビュー OFF 中は止める）
+let exeSource = null;  // キャプチャするウィンドウの ID（無ければ null）
+let streamSource = null;
+let stream = null;
+let videoGen = 0;      // 取得待ちの間に次の要求が来たら、古い方の結果は捨てる
+async function updateVideo() {
+  const want = previewOn ? exeSource : null;
+  if (want === streamSource) return;
+  const gen = ++videoGen;
+  stream?.getTracks().forEach((t) => t.stop());
+  stream = null;
+  streamSource = want;
+  video.srcObject = null;
+  if (!want) return;
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { mandatory: {
+        chromeMediaSource: 'desktop', chromeMediaSourceId: want,
+        maxWidth: 1920, maxHeight: 1080, maxFrameRate: 30,
+      } },
+    });
+    if (gen !== videoGen) { s.getTracks().forEach((t) => t.stop()); return; } // 待っている間に変わった
+    stream = s;
+    video.srcObject = s;
+  } catch (e) {
+    if (gen === videoGen) msg.textContent = `プレビューを取得できません: ${e.message}`;
+  }
+}
+window.api.onSource((id) => { exeSource = id; updateVideo(); });
+$('#exe-close').addEventListener('click', () => window.api.closeExe());
+window.api.onStatus((m) => { msg.textContent = m; });
 
 // ---- プレビュー上の操作を転送 ----
 const frame = $('#frame');
@@ -248,10 +331,15 @@ window.api.onBounds(setupPreview);
 (async () => {
   const s = await window.api.init();
   requested = s.requested;
+  running = s.running;
   renderList(s.list);
   setCurrentUrl(s.url);
   setupPreview(s.bounds);
   setPreviewState(s.previewOn);
   setModeState(s.virtual);
   if (s.frame && !img.src) showFrame(s.frame);
+  if (s.status) msg.textContent = s.status;
+  setBlackoutState(s.blackout);
+  exeSource = s.source;
+  updateVideo();
 })();

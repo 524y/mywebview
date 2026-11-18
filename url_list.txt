@@ -1,4 +1,8 @@
 # 1 行に 1 件:「表示名, URL」  （# で始まる行はコメント）
+# URL の代わりに exe も指定できる:「表示名, "C:\Program Files\Example\app.exe" 引数...」
+# exe のパスには %LOCALAPPDATA% 等の環境変数を使える（ユーザー名を含むパスを書かずに済む）
 google, https://www.google.com/
 google map, https://www.google.com/maps
 yahoo japan, https://www.yahoo.co.jp/
+メモ帳, C:\Windows\System32\notepad.exe
+ペイント, %LOCALAPPDATA%\Microsoft\WindowsApps\mspaint.exe

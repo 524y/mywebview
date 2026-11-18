@@ -5,8 +5,12 @@ const fs = require('node:fs');
 const { parseArgs } = require('node:util');
 const { parseExe, launchExe } = require('./exe');
 
+// 何も表示しない（黒い画面）。起動時に表示対象を指定しなかったとき
+const BLANK = `data:text/html,${encodeURIComponent('<html style="background:#000;cursor:none"><!--mywebview-blank--></html>')}`;
+const isBlank = (url) => typeof url === 'string' && url.startsWith('data:') && url.includes('mywebview-blank');
+
 const DEFAULTS = {
-  url: 'https://www.google.com/',
+  url: BLANK,
   // 座標は DIP（表示倍率で換算後の値）。1920x1080@150% のモニターは 1280x720 として扱われる
   x: 1280, y: 0, width: 3840, height: 720,
 };
@@ -250,7 +254,7 @@ app.whenReady().then(() => {
   const exes = new Map();   // 起動中の exe（キー: exe の指定文字列 → launchExe() の戻り値）
   let front = null;         // 前に出している exe（null なら Web ページ）
   let history = [];         // 前に出した順（後ろほど新しい）。exe か 'web'。exe を閉じたときに 1 つ前に戻すのに使う
-  let lastUrl = DEFAULTS.url; // 最後に表示した URL
+  let lastUrl = DEFAULTS.url; // 最後に表示した URL（黒い画面のこともある）
   let status = '';          // パネルに出す状態メッセージ
   let quitting = false;
   let retryTimer = null;    // 読み込み失敗後の再試行
@@ -281,15 +285,17 @@ app.whenReady().then(() => {
     if (!panel.isDestroyed()) panel.webContents.send(channel, ...args);
   };
   const alive = () => display && !display.isDestroyed();
-  const currentTarget = () => (front ? front.text : alive() ? display.webContents.getURL() || lastUrl : '');
+  // 入力欄に出す URL（黒い画面のときは空）
+  const shownUrl = (url) => (isBlank(url) ? '' : url);
+  const currentTarget = () => (front ? front.text : alive() ? shownUrl(display.webContents.getURL() || lastUrl) : '');
   // 前に出しているもの（リストで表示中にする）: exe の指定文字列 / 'web'（ブラウザ表示）/ ''（何も無い）
   const selectedKey = () => (front ? front.text : alive() ? 'web' : '');
   // ブラウザ表示の今の URL（exe を前に出している間も。リストのブラウザ表示の行に出す）
-  //   → { url, canGoBack, canGoForward } | null（ブラウザ表示が無い）
+  //   → { url, canGoBack, canGoForward } | null（ブラウザ表示が無い）。url は黒い画面のときは空
   const webState = () => {
     if (!alive()) return null;
     const h = display.webContents.navigationHistory;
-    return { url: display.webContents.getURL() || lastUrl, canGoBack: h.canGoBack(), canGoForward: h.canGoForward() };
+    return { url: shownUrl(display.webContents.getURL() || lastUrl), canGoBack: h.canGoBack(), canGoForward: h.canGoForward() };
   };
   const sendWeb = () => sendToPanel('display:web', webState());
   const sendSelected = () => {
@@ -458,7 +464,7 @@ app.whenReady().then(() => {
     });
     const onNavigate = () => {
       if (display !== win) return;
-      if (!front) sendToPanel('display:url', win.webContents.getURL()); // exe を前に出している間は入力欄を変えない
+      if (!front) sendToPanel('display:url', shownUrl(win.webContents.getURL())); // exe を前に出している間は入力欄を変えない
       sendWeb();
     };
     win.webContents.on('did-navigate', onNavigate);

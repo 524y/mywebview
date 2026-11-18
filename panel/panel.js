@@ -42,7 +42,7 @@ function updateWebRow() {
   const li = listEl.querySelector('li.web');
   if (!li || !web) return;
   const u = li.querySelector('.u');
-  u.textContent = web.url;
+  u.textContent = web.url || '（何も表示していません：黒い画面）';
   u.title = web.url;
   li.querySelector('.back').disabled = !web.canGoBack;
   li.querySelector('.forward').disabled = !web.canGoForward;

@@ -31,7 +31,7 @@
 
 ```sh
 npm install
-npm start                                   # 既定の URL で、拡張モニター全部に表示
+npm start                                   # 黒い画面で起動し、拡張モニター全部に表示
 npm start -- https://example.com --x 1280 --y 0 --w 3840 --h 720   # 位置・サイズを指定
 npm start -- "C:\Program Files\Example\app.exe"   # exe を表示（Windows のみ）
 npm test                                    # exe の指定の解析などを確認
@@ -39,7 +39,7 @@ npm test                                    # exe の指定の解析などを確
 
 | オプション | 説明 |
 |---|---|
-| `URL` | 最初に表示する URL（既定: `https://www.google.com/`）。スキーム省略時は `https://`。exe のパスも指定できる |
+| `URL` | 最初に表示する URL（省略時は何も表示しない＝黒い画面。リストから選ぶと表示する）。スキーム省略時は `https://`。exe のパスも指定できる |
 | `--x`, `--y` | 表示位置。1 つでも指定すると自動配置をやめ、指定しなかった値は既定値（x=1280, y=0, 3840×720）を使う |
 | `--w` / `--width`, `--h` / `--height` | 表示サイズ（同上） |
 | `--virtual` | 疑似表示で起動（モニターに出さずプレビューのみ） |

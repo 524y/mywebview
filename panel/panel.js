@@ -152,6 +152,8 @@ window.api.onRunning((list) => { running = list; renderList(); });
 function splitPoints({ width, height }) {
   const seg = (height * 16) / 9;
   const pts = [];
+  // 高さが 0 だと seg も 0 でループが終わらず、パネルが固まる（exe が高さ 0 のウィンドウを作ったとき等）
+  if (!(seg > 0)) return pts;
   for (let x = seg; x < width - 0.5; x += seg) pts.push(x / width);
   return pts;
 }

@@ -275,7 +275,10 @@ app.whenReady().then(() => {
   // パネルにファイルやリンクを落としても、パネル自体を別のページに移動させない
   panel.webContents.on('will-navigate', (e) => e.preventDefault());
   // パネルが異常終了したら読み込み直す（状態は panel:init で復元される）
-  panel.webContents.on('render-process-gone', () => panel.reload());
+  //   少し待つ（起動に失敗し続ける場合に、休みなく繰り返さない）。待つ間に終了していたら何もしない
+  panel.webContents.on('render-process-gone', () => {
+    setTimeout(() => { if (!panel.isDestroyed()) panel.reload(); }, 1000);
+  });
   app.on('second-instance', () => {
     if (panel.isMinimized()) panel.restore();
     panel.focus();

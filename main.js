@@ -432,6 +432,9 @@ app.whenReady().then(() => {
     });
     // target=_blank 等の新規ウィンドウは同じウィンドウで開く
     win.webContents.setWindowOpenHandler(({ url: u }) => {
+      // 空のウィンドウを開いてから中身を入れるページ（window.open() の後で移動先を設定する等）の about:blank は
+      // 読み込まない（表示中のページが真っ白な画面に置き換わるだけになる）
+      if (u === 'about:blank') return { action: 'deny' };
       win.loadURL(u).catch(() => {}); // 読み込み失敗は did-fail-load で扱う
       return { action: 'deny' };
     });

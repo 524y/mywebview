@@ -260,12 +260,18 @@ modeBtn.addEventListener('click', async () => {
   }
 });
 
-let lastObjectUrl = null;
+let lastObjectUrl = null;    // 表示中のフレーム
+let loadingObjectUrl = null; // 読み込み中のフレーム
 function showFrame(jpeg) {
   const objUrl = URL.createObjectURL(new Blob([jpeg], { type: 'image/jpeg' }));
+  // 前のフレームの読み込みが終わる前に次が来ると、前の分の onload は来ない（読み込みに失敗したときも）。
+  // ここで解放しないと、長時間のうちに溜まり続ける
+  if (loadingObjectUrl) URL.revokeObjectURL(loadingObjectUrl);
+  loadingObjectUrl = objUrl;
   img.onload = () => {
     if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
     lastObjectUrl = objUrl;
+    loadingObjectUrl = null;
   };
   img.src = objUrl;
 }

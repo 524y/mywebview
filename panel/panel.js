@@ -11,19 +11,42 @@ const video = $('#preview-video'); // exe 表示中のプレビュー（ウィ�
 let currentUrl = '';
 let previewOn = true;
 
-// ---- 現在の URL ----
+// ---- 現在の URL（入力欄に出す） ----
 function setCurrentUrl(url) {
   currentUrl = url;
   if (document.activeElement !== urlInput) urlInput.value = url; // 入力中は上書きしない
+}
+
+// ---- 表示中のもの・フォーカスの場所（リストに出す） ----
+//   ブラウザ表示は 1 行にまとめ、今の URL を出す（地図等、操作で URL が変わっても追える）。
+//   その行を押すと読み込み直さずに戻る。URL の項目を押すと、その URL を読み込み直す
+let selected = '';        // 前に出しているもの: exe の指定文字列 / 'web' / ''
+let webUrl = '';          // ブラウザ表示の今の URL（無ければ ''）
+let focusWhere = 'other'; // 'display' | 'panel' | 'other'
+function markList() {
   for (const b of listEl.querySelectorAll('button.item')) {
-    b.classList.toggle('current', sameUrl(b.dataset.url, url));
+    b.classList.toggle('current', Boolean(selected) && b.dataset.key === selected);
+    b.classList.toggle('focused', focusWhere === 'display'); // 表示中の項目にだけ見える（CSS）
   }
 }
+window.api.onSelected((key) => { selected = key; markList(); });
+window.api.onFocus((where) => { focusWhere = where; markList(); });
+window.api.onWebUrl((url) => {
+  const had = Boolean(webUrl);
+  webUrl = url;
+  if (had !== Boolean(url)) renderList(); // 行を出す・消す
+  else { const u = listEl.querySelector('.web .u'); if (u) { u.textContent = url; u.title = url; } }
+});
 const sameUrl = (a, b) => a.replace(/\/$/, '') === b.replace(/\/$/, '');
 
 async function navigate(url) {
   msg.textContent = ''; // exe の状態メッセージは応答より先に届くので、応答後には消さない
   const err = await window.api.navigate(url);
+  if (err) msg.textContent = err;
+}
+async function showWeb() {
+  msg.textContent = '';
+  const err = await window.api.showWeb();
   if (err) msg.textContent = err;
 }
 
@@ -40,31 +63,47 @@ urlInput.addEventListener('focus', () => urlInput.select());
 // ---- URL リスト ----
 let listData = { file: '', items: [], error: null };
 let running = []; // 起動中の exe（指定文字列）
+// url_list.txt に無い起動中の exe（入力欄から起動したもの）の表示名: exe のファイル名
+const exeName = (text) => text.replace(/^"([^"]+)".*$|^(\S+\.exe).*$/i, '$1$2').split('\\').pop();
+
+// 1 行分（key: 表示中かを判定する値）
+function listItem({ name, url, key, onClick }) {
+  const li = document.createElement('li');
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'item';
+  b.dataset.key = key;
+  b.innerHTML = '<span class="name"></span><span class="badge focus">フォーカス</span><span class="u"></span>';
+  b.querySelector('.name').textContent = name;
+  b.querySelector('.u').textContent = url;
+  b.querySelector('.u').title = url;
+  b.addEventListener('click', onClick);
+  li.append(b);
+  return li;
+}
+
 function renderList(data = listData) {
   listData = data;
   const { file, items, error } = data;
   $('#list-path').textContent = file;
   $('#list-path').title = file;
   $('#list-error').textContent = error ?? (items.length ? '' : 'URL が登録されていません');
-  // url_list.txt に無い起動中の exe（入力欄から起動したもの）も出して、終了できるようにする
-  const extra = running.filter((r) => !items.some((it) => it.url === r))
-    .map((r) => ({ name: r.split('\\').pop(), url: r }));
-  listEl.replaceChildren(...[...items, ...extra].map(({ name, url }) => {
-    const li = document.createElement('li');
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'item';
-    b.dataset.url = url;
-    b.innerHTML = '<span class="name"></span><span class="u"></span>';
-    b.querySelector('.name').textContent = name;
-    b.querySelector('.u').textContent = url;
-    b.addEventListener('click', () => navigate(url));
-    li.append(b);
+  const rows = [];
+  if (webUrl) {
+    const li = listItem({ name: 'ブラウザ表示', url: webUrl, key: 'web', onClick: showWeb });
+    li.classList.add('web');
+    li.querySelector('.item').title = '今のページのまま前に出します（読み込み直しません）';
+    rows.push(li);
+  }
+  // url_list.txt に無い起動中の exe（入力欄から起動したもの）も出して、戻ったり終了したりできるようにする
+  const extra = running.filter((r) => !items.some((it) => it.url === r)).map((r) => ({ name: exeName(r), url: r }));
+  for (const { name, url } of [...items, ...extra]) {
+    const li = listItem({ name, url, key: url, onClick: () => navigate(url) });
     if (running.includes(url)) {
       const badge = document.createElement('span');
       badge.className = 'badge';
       badge.textContent = '起動中';
-      b.querySelector('.name').after(badge);
+      li.querySelector('.name').after(badge);
       const c = document.createElement('button');
       c.type = 'button';
       c.className = 'btn close';
@@ -72,10 +111,15 @@ function renderList(data = listData) {
       c.title = 'このアプリを閉じます';
       c.addEventListener('click', () => window.api.closeExe(url));
       li.append(c);
+    } else if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) {
+      li.querySelector('.item').title = 'アプリを起動します';
+    } else {
+      li.querySelector('.item').title = 'この URL を読み込みます（ブラウザ表示の今のページは置き換わります）';
     }
-    return li;
-  }));
-  setCurrentUrl(currentUrl);
+    rows.push(li);
+  }
+  listEl.replaceChildren(...rows);
+  markList();
 }
 $('#list-reload').addEventListener('click', async () => renderList(await window.api.reloadList()));
 window.api.onRunning((list) => { running = list; renderList(); });
@@ -332,6 +376,9 @@ window.api.onBounds(setupPreview);
   const s = await window.api.init();
   requested = s.requested;
   running = s.running;
+  focusWhere = s.focus;
+  selected = s.selected;
+  webUrl = s.webUrl;
   renderList(s.list);
   setCurrentUrl(s.url);
   setupPreview(s.bounds);

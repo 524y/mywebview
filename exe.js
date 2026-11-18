@@ -37,6 +37,8 @@ const SIGS = {
     'BOOL __stdcall RedrawWindow(HWND hwnd, void *rect, void *rgn, uint32_t flags)',
     'BOOL __stdcall GetWindowRect(HWND hwnd, _Out_ RECT *rect)',
     'BOOL __stdcall SetForegroundWindow(HWND hwnd)',
+    'HWND __stdcall GetForegroundWindow()',
+    'HWND __stdcall GetAncestor(HWND hwnd, uint32_t flags)',
     'BOOL __stdcall PostMessageW(HWND hwnd, uint32_t msg, uintptr_t wparam, intptr_t lparam)',
     'intptr_t __stdcall SendMessageTimeoutW(HWND hwnd, uint32_t msg, uintptr_t wparam, intptr_t lparam, uint32_t flags, uint32_t timeout, void *result)',
     'HWND __stdcall ChildWindowFromPointEx(HWND hwnd, POINT pt, uint32_t flags)',
@@ -83,7 +85,7 @@ function win32() {
   return w;
 }
 
-const GWL_STYLE = -16, GWL_EXSTYLE = -20, GCL_STYLE = -26, GW_OWNER = 4;
+const GWL_STYLE = -16, GWL_EXSTYLE = -20, GCL_STYLE = -26, GW_OWNER = 4, GA_ROOTOWNER = 3;
 const WS_CAPTION = 0x00C00000, FRAME_STYLE = WS_CAPTION | 0x00040000; // | WS_THICKFRAME
 const FRAME_EXSTYLE = 0x1 | 0x100 | 0x200 | 0x20000;         // WS_EX_DLGMODALFRAME | WINDOWEDGE | CLIENTEDGE | STATICEDGE
 const WS_EX_TOOLWINDOW = 0x80, CS_DBLCLKS = 0x8, DWMWA_EXTENDED_FRAME_BOUNDS = 9, DWMWA_CLOAKED = 14;
@@ -179,6 +181,7 @@ function launchExe({ file, args, text }, getRect, onChange) {
   let placedAt = 0;
   let keepFrame = false; // 枠を外さない（タイトルバーをアプリ自身が描いている）
   let captured = 0;    // ボタンを押している間の送り先（マウスキャプチャの代わり）
+  let wantFocus = false; // 次に配置したらフォーカスを移す（ウィンドウがまだ無ければ、見つかったときに）
   let lastRect = '';
 
   const child = spawn(file, args, { cwd: path.dirname(file), stdio: 'ignore' });
@@ -278,6 +281,10 @@ function launchExe({ file, args, text }, getRect, onChange) {
     if (!placedAt || hasFrame() || w.IsZoomed(hwnd) || (Date.now() - placedAt < KEEP_MS && !samePlace())) {
       if (place() && !placedAt) placedAt = Date.now();
     }
+    if (wantFocus && placedAt) {
+      wantFocus = false;
+      w.SetForegroundWindow(hwnd);
+    }
     const r = JSON.stringify(visibleRectOf(hwnd));
     if (r !== lastRect) {
       lastRect = r;
@@ -313,6 +320,16 @@ function launchExe({ file, args, text }, getRect, onChange) {
     get hwnd() { return hwnd; },
     get ended() { return closed; },
     rect: () => (hwnd ? visibleRectOf(hwnd) : null),
+    // フォーカスを移す（アクティブにする）
+    focus() {
+      if (hwnd && !hidden) w.SetForegroundWindow(hwnd);
+    },
+    // アクティブ（キー入力を受け取る）か。このウィンドウが出したダイアログ（保存の確認等）がアクティブな場合も含む
+    focused() {
+      if (!hwnd) return false;
+      const fg = w.GetForegroundWindow();
+      return Boolean(fg) && (fg === hwnd || w.GetAncestor(fg, GA_ROOTOWNER) === hwnd);
+    },
 
     // プレビュー上のマウス操作を送る（fx, fy: ウィンドウ内の位置 0〜1）
     //   カーソルを動かさないよう PostMessage で送るので、アプリによっては効かない（DirectX・Raw Input 等）。
@@ -361,12 +378,14 @@ function launchExe({ file, args, text }, getRect, onChange) {
     // 背面に回す（最小化）
     hide() {
       hidden = true;
+      wantFocus = false;
       captured = 0;
       if (hwnd) w.ShowWindowAsync(hwnd, SW_SHOWMINNOACTIVE);
     },
-    // 前に出す（元に戻して配置し直す）
-    show() {
+    // 前に出す（元に戻して配置し直す）。focus: フォーカスも移す
+    show({ focus = false } = {}) {
       hidden = false;
+      wantFocus = focus;
       placedAt = 0;
       safeTick(); // 次の周期を待たずに配置する
     },

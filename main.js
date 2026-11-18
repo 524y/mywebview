@@ -17,6 +17,7 @@ const INTERACTIVE_INTERVAL_MS = 100; // プレビュー上で操作中の更新�
 const INTERACTIVE_HOLD_MS = 2000;    // 最後の操作からこの時間は速い更新を続ける
 const RETRY_MS = 5000;         // 読み込みに失敗したとき、再試行するまでの時間
 const QUICK_CLOSE_MS = 3000;   // 表示してすぐにページがウィンドウを閉じたら、作り直さない（繰り返しを防ぐ）
+const FOCUS_POLL_MS = 300;     // フォーカスの場所を調べる間隔（パネルに表示する）
 const REPLACE_DELAY_MS = 1000; // モニター構成が変わってから置き直すまでの時間（OS がウィンドウを動かし終えるのを待つ）
 
 // プレビューから転送を許可する入力イベント
@@ -210,6 +211,7 @@ app.whenReady().then(() => {
   let status = '';          // パネルに出す状態メッセージ
   let quitting = false;
   let retryTimer = null;    // 読み込み失敗後の再試行
+  let focusOnShow = false;  // 最初の描画が済んで表示用ウィンドウを出すときに、フォーカスを移す
 
   // 操作せずに映し続けても、モニターのスリープ・スクリーンセーバーに入らせない
   powerSaveBlocker.start('prevent-display-sleep');
@@ -236,6 +238,14 @@ app.whenReady().then(() => {
   };
   const alive = () => display && !display.isDestroyed();
   const currentTarget = () => (front ? front.text : alive() ? display.webContents.getURL() || lastUrl : '');
+  // 前に出しているもの（リストで表示中にする）: exe の指定文字列 / 'web'（ブラウザ表示）/ ''（何も無い）
+  const selectedKey = () => (front ? front.text : alive() ? 'web' : '');
+  // ブラウザ表示の今の URL（exe を前に出している間も。リストのブラウザ表示の行に出す）
+  const webUrl = () => (alive() ? display.webContents.getURL() || lastUrl : '');
+  const sendSelected = () => {
+    sendToPanel('display:selected', selectedKey());
+    sendToPanel('display:web-url', webUrl());
+  };
   const setStatus = (m) => { status = m; sendToPanel('display:status', m); };
   // Web ページの状態。exe を前に出している間は、exe の状態表示を上書きしない
   const setWebStatus = (m) => { if (!front) setStatus(m); };
@@ -345,9 +355,11 @@ app.whenReady().then(() => {
     win.once('ready-to-show', () => {
       if (display === win) displayReady = true;
       if (!virtual && !front) { // exe を前に出していたら、Web ページに切り替えたときに出す
-        win.showInactive(); // パネルからフォーカスを奪わない
+        win.showInactive(); // パネルからフォーカスを奪わない（パネルで選んだときは下で移す）
         win.setBounds(bounds);
+        if (focusOnShow && display === win) win.focus();
       }
+      if (display === win) focusOnShow = false;
       onBoundsChange();
       if (opts.debug) {
         const displays = screen.getAllDisplays().map((d, i) =>
@@ -394,7 +406,11 @@ app.whenReady().then(() => {
         { cssOrigin: 'user' },
       ).catch(() => {});
     });
-    const onNavigate = () => sendToPanel('display:url', win.webContents.getURL());
+    const onNavigate = () => {
+      if (display !== win) return;
+      if (!front) sendToPanel('display:url', win.webContents.getURL()); // exe を前に出している間は入力欄を変えない
+      sendToPanel('display:web-url', win.webContents.getURL());
+    };
     win.webContents.on('did-navigate', onNavigate);
     // 読み込めた（失敗時は did-navigate が来ない）
     win.webContents.on('did-navigate', () => {
@@ -421,6 +437,7 @@ app.whenReady().then(() => {
       if (Date.now() - createdAt < QUICK_CLOSE_MS) {
         setStatus('ページがすぐにウィンドウを閉じたため、表示をやめました');
         sendToPanel('display:url', currentTarget());
+        sendSelected();
         return;
       }
       createDisplay(lastUrl);
@@ -436,9 +453,15 @@ app.whenReady().then(() => {
   // プレビューには裏の実際の内容が映り続ける（消している間に次の準備ができる）
   let blackout = false;
   let blackWin = null;
+  //   戻したときは、消す前にフォーカスがあったのが表示側なら、表示側に戻す
+  let refocusOnRestore = false;
   function setBlackout(on) {
     // 疑似表示ではモニターに出していない（表示領域がパネルのモニターに重なることもある）ので使わない
-    blackout = Boolean(on) && !virtual;
+    const next = Boolean(on) && !virtual;
+    if (next && !blackout) refocusOnRestore = focusBeforePanel() === 'display';
+    const restoring = blackout && !next;
+    blackout = next;
+    if (restoring && refocusOnRestore) setImmediate(focusFront); // 黒いウィンドウを隠してから
     if (blackout) {
       if (!blackWin || blackWin.isDestroyed()) {
         blackWin = new BrowserWindow({
@@ -475,24 +498,30 @@ app.whenReady().then(() => {
 
   // ---- 表示の切り替え ----
   // 前に出すものを切り替える（next: exe か null = Web ページ）。前に出ていたものは隠す（exe は最小化）
-  function bringToFront(next) {
+  //   focus: 前に出したウィンドウにフォーカスを移す（パネルで選んだとき）。疑似表示の Web ページは画面に無いので移さない
+  function bringToFront(next, { focus = false } = {}) {
     const prev = front;
     front = next;
     history = history.filter((v) => v !== (next ?? 'web'));
     history.push(next ?? 'web');
     // 先に出してから隠す（逆だと一瞬デスクトップが見える）
+    focusOnShow = false;
     if (next) {
-      next.show();
+      next.show({ focus }); // ウィンドウがまだ無ければ、見つかったときにフォーカスを移す
       if (alive() && !virtual) display.hide();
     } else if (alive() && !virtual && displayReady) { // 最初の描画前なら ready-to-show で出る
-      display.showInactive(); // パネルからフォーカスを奪わない
+      display.showInactive(); // パネルからフォーカスを奪わない（パネルで選んだときは下で移す）
       display.setBounds(bounds);
       display.moveTop();
+      if (focus) display.focus();
+    } else if (focus && !virtual) {
+      focusOnShow = true;
     }
     if (prev && prev !== next) prev.hide();
     setPreview(previewOn);
     sendToPanel('preview:source', sourceId());
     sendToPanel('display:url', currentTarget());
+    sendSelected();
     onBoundsChange();
     setStatus(next ? exeNote() : '');
   }
@@ -505,13 +534,14 @@ app.whenReady().then(() => {
       history = history.filter((v) => v !== exe);
       if (front === exe) {
         front = null; // 終了した exe を隠そうとしないよう、先に外す
-        // 1 つ前に表示していたものに戻す。無ければ何も表示しない
+        // 1 つ前に表示していたものに戻し、フォーカスも移す。無ければ何も表示しない
         const prev = history.at(-1);
         if (prev) {
-          bringToFront(prev === 'web' ? null : prev);
+          bringToFront(prev === 'web' ? null : prev, { focus: true });
         } else {
           sendToPanel('preview:source', null);
           sendToPanel('display:url', currentTarget());
+          sendSelected();
           onBoundsChange();
         }
       }
@@ -527,7 +557,8 @@ app.whenReady().then(() => {
 
   // 表示対象（URL または exe）を切り替える。エラーならメッセージを返す
   //   exe は起動中ならそのまま前に出し、前に出ていた exe は閉じずに最小化しておく
-  function show(raw) {
+  //   focus: 前に出したウィンドウにフォーカスを移す（パネルで選んだとき）
+  function show(raw, { focus = false } = {}) {
     const t = parseTarget(raw);
     if (!t) return `不正な URL です: ${raw}`;
     if (t.url) {
@@ -535,7 +566,7 @@ app.whenReady().then(() => {
       clearTimeout(retryTimer); // 前の URL の再試行で、この切り替えを取り消さない
       if (alive()) display.loadURL(t.url).catch(() => {}); // 読み込み失敗は did-fail-load で扱う
       else createDisplay(t.url);
-      bringToFront(null);
+      bringToFront(null, { focus });
       return null;
     }
     if (process.platform !== 'win32') return 'exe の表示は Windows のみ対応しています';
@@ -550,12 +581,12 @@ app.whenReady().then(() => {
       exes.set(t.exe.text, exe);
       sendRunning();
     }
-    bringToFront(exe);
+    bringToFront(exe, { focus });
     if (isNew) setStatus(['起動中…', exeNote()].filter(Boolean).join('　'));
     return null;
   }
 
-  const startError = show(opts.target);
+  const startError = show(opts.target, { focus: true }); // 起動時のフォーカスも表示側に（パネルは後から選べる）
   if (startError) {
     console.error(startError);
     dialog.showErrorBox('mywebview', startError);
@@ -582,9 +613,44 @@ app.whenReady().then(() => {
   };
   for (const ev of ['display-added', 'display-removed', 'display-metrics-changed']) screen.on(ev, replaceLater);
 
+  // ---- フォーカスの場所（パネルに表示する） ----
+  //   'display': 表示側（Web ページ・前に出している exe）/ 'panel': コントロールパネル / 'other': 他のアプリ等
+  //   exe のウィンドウは他のプロセスのものでイベントが来ないので、定期的に調べて変わったときだけ送る
+  const focusState = () => {
+    let onDisplay = false;
+    try {
+      onDisplay = front ? front.focused() : alive() && !virtual && display.isFocused();
+    } catch {
+      // exe のウィンドウが閉じた直後等は調べられないことがある
+    }
+    if (onDisplay) return 'display';
+    return !panel.isDestroyed() && panel.isFocused() ? 'panel' : 'other';
+  };
+  let focus = focusState();
+  let prevFocus = focus; // 1 つ前のフォーカスの場所（パネルのボタンを押す前にどこにあったか）
+  setInterval(() => {
+    const next = focusState();
+    if (next === focus) return;
+    prevFocus = focus;
+    sendToPanel('display:focus', (focus = next));
+  }, FOCUS_POLL_MS);
+  // パネルを操作する直前のフォーカスの場所（ボタンを押すとパネルに移るので、その前）
+  const focusBeforePanel = () => {
+    const now = focusState();
+    if (now !== 'panel') return now;
+    return focus === 'panel' ? prevFocus : focus; // まだ定期の確認で気づいていなければ、focus が直前の場所
+  };
+  // 前に出しているもの（Web ページ・exe）にフォーカスを移す
+  const focusFront = () => {
+    if (front) front.focus();
+    else if (alive() && !virtual) display.focus();
+  };
+
   // ---- パネルからの要求 ----
   ipcMain.handle('panel:init', () => ({
     url: currentTarget(),
+    selected: selectedKey(),
+    webUrl: webUrl(),
     list: loadUrlList(),
     requested: bounds,
     bounds: currentBounds(),
@@ -592,11 +658,20 @@ app.whenReady().then(() => {
     source: sourceId(),
     running: [...exes.keys()],
     blackout,
+    focus,
     status,
     previewOn,
     virtual,
   }));
-  ipcMain.handle('panel:navigate', (_e, raw) => show(raw));
+  ipcMain.handle('panel:navigate', (_e, raw) => show(raw, { focus: true }));
+  // ブラウザ表示に戻す（読み込み直さず、今のページのまま前に出す）
+  ipcMain.handle('panel:show-web', () => {
+    if (alive()) {
+      bringToFront(null, { focus: true });
+      return null;
+    }
+    return show(lastUrl, { focus: true }); // 閉じていたら（すぐ閉じるページ等）最後の URL で開き直す
+  });
   // exe を閉じる（text 省略時は前に出ている exe）。exe は枠を消しているので閉じるボタンが無い
   ipcMain.handle('panel:close-exe', (_e, text) => {
     const exe = text ? exes.get(text) : front;

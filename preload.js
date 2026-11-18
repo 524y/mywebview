@@ -9,6 +9,9 @@ contextBridge.exposeInMainWorld('api', {
   setVirtual: (on) => ipcRenderer.invoke('panel:set-virtual', on),
   setBlackout: (on) => ipcRenderer.invoke('panel:set-blackout', on),
   reloadList: () => ipcRenderer.invoke('panel:reload-list'),
+  showWeb: () => ipcRenderer.invoke('panel:show-web'),
+  onSelected: (cb) => ipcRenderer.on('display:selected', (_e, key) => cb(key)),
+  onWebUrl: (cb) => ipcRenderer.on('display:web-url', (_e, url) => cb(url)),
   input: (ev) => ipcRenderer.send('panel:input', ev),
   insertText: (text) => ipcRenderer.send('panel:insert-text', text),
   onUrl: (cb) => ipcRenderer.on('display:url', (_e, url) => cb(url)),
@@ -18,4 +21,5 @@ contextBridge.exposeInMainWorld('api', {
   onStatus: (cb) => ipcRenderer.on('display:status', (_e, m) => cb(m)),
   onRunning: (cb) => ipcRenderer.on('display:running', (_e, list) => cb(list)),
   onBlackout: (cb) => ipcRenderer.on('display:blackout', (_e, on) => cb(on)),
+  onFocus: (cb) => ipcRenderer.on('display:focus', (_e, where) => cb(where)),
 });

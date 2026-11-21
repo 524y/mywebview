@@ -261,7 +261,11 @@ function setCurtainState(closed) {
   curtainBtn.textContent = closed ? '幕を開ける' : '幕を閉める';
   $('#frame').classList.toggle('curtain', closed);
 }
-curtainBtn.addEventListener('click', async () => setCurtainState(await window.api.setCurtain(!curtainClosed)));
+curtainBtn.addEventListener('click', async (e) => {
+  // ダブルクリック・連打の 2 回目以降は数えない（開けてすぐ閉め直してしまう）。キーボードで押したときは 0
+  if (e.detail > 1) return;
+  setCurtainState(await window.api.setCurtain(!curtainClosed));
+});
 window.api.onCurtain(setCurtainState);
 modeBtn.addEventListener('click', async () => {
   modeBtn.disabled = true;

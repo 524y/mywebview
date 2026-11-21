@@ -18,18 +18,24 @@ const ready = img
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 幕を閉める（true）・開ける（false）。動き終わったら解決する（main.js が executeJavaScript で呼ぶ）
+// 最後に受けた指示の番号。動いている間に次の指示が来たら、前の指示はそこで終える（次の指示が今の位置から動かす）
+let latest = 0;
+
+// 幕を閉める（true）・開ける（false）。main.js が executeJavaScript で呼ぶ
 //   instant: 動きを見せずに、すぐその状態にする（幕のウィンドウを作り直したとき）
-//   どの待ちにも上限を置く（終わらないと、main.js 側で後の開け閉めがすべて待たされる）
+//   → 動き終わったら true。動いている間に次の指示が来たら false
+//   どの待ちにも上限を置く（終わらないと、main.js 側が幕のウィンドウを作り直す）
 window.curtain = async (close, instant = false) => {
+  const me = ++latest;
   // 画像の読み込みが遅ければ、待たずに CSS の幕で動かす（読み込めたら画像に替わる）
   await Promise.race([ready, sleep(3000)]);
+  if (me !== latest) return false;
   if (instant) {
     c.style.transition = 'none';
     c.classList.toggle('closed', close);
     c.getBoundingClientRect(); // ここで反映させる（transition を戻したときに動き出さないように）
     c.style.transition = '';
-    return;
+    return true;
   }
   // ウィンドウを出した直後でも動きが見えるよう、2 フレーム待ってから動かす。
   // 描画が止まっていてフレームが来なくても、先に進んで状態だけは合わせる
@@ -37,10 +43,10 @@ window.curtain = async (close, instant = false) => {
     new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))),
     sleep(1000),
   ]);
-  if (c.classList.contains('closed') === close) return;
+  if (me !== latest) return false;
+  // 動いている途中なら、その位置から向きを変える（戻る分だけの時間で動く）
   c.classList.toggle('closed', close);
-  await new Promise((r) => {
-    const t = setTimeout(r, 5000); // transitionend が来なくても先に進む
-    c.addEventListener('transitionend', () => { clearTimeout(t); r(); }, { once: true });
-  });
+  // 動き終わるのを待つ（向きを変えられたときも、ここで待つのをやめる）。描画が止まっていて終わらなくても先に進む
+  await Promise.race([Promise.allSettled(c.getAnimations().map((a) => a.finished)), sleep(4000)]);
+  return me === latest;
 };

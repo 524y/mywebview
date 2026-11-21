@@ -16,11 +16,27 @@ const ready = img
   })
   : Promise.resolve();
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // 幕を閉める（true）・開ける（false）。動き終わったら解決する（main.js が executeJavaScript で呼ぶ）
-window.curtain = async (close) => {
-  await ready;
-  // ウィンドウを出した直後でも動きが見えるよう、2 フレーム待ってから動かす
-  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+//   instant: 動きを見せずに、すぐその状態にする（幕のウィンドウを作り直したとき）
+//   どの待ちにも上限を置く（終わらないと、main.js 側で後の開け閉めがすべて待たされる）
+window.curtain = async (close, instant = false) => {
+  // 画像の読み込みが遅ければ、待たずに CSS の幕で動かす（読み込めたら画像に替わる）
+  await Promise.race([ready, sleep(3000)]);
+  if (instant) {
+    c.style.transition = 'none';
+    c.classList.toggle('closed', close);
+    c.getBoundingClientRect(); // ここで反映させる（transition を戻したときに動き出さないように）
+    c.style.transition = '';
+    return;
+  }
+  // ウィンドウを出した直後でも動きが見えるよう、2 フレーム待ってから動かす。
+  // 描画が止まっていてフレームが来なくても、先に進んで状態だけは合わせる
+  await Promise.race([
+    new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))),
+    sleep(1000),
+  ]);
   if (c.classList.contains('closed') === close) return;
   c.classList.toggle('closed', close);
   await new Promise((r) => {

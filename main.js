@@ -24,6 +24,9 @@ const RETRY_MS = 5000;         // 読み込みに失敗したとき、再試行�
 const QUICK_CLOSE_MS = 3000;   // 表示してすぐにページがウィンドウを閉じたら、作り直さない（繰り返しを防ぐ）
 const FOCUS_POLL_MS = 300;     // フォーカスの場所を調べる間隔（パネルに表示する）
 const REPLACE_DELAY_MS = 1000; // モニター構成が変わってから置き直すまでの時間（OS がウィンドウを動かし終えるのを待つ）
+const CURTAIN_LOAD_MS = 10000;  // 幕のページの読み込みを待つ上限（幕の画像の読み込みを含む）
+const CURTAIN_STEP_MS = 8000;   // 幕の 1 回の動き（2.5 秒）を待つ上限
+const CURTAIN_RETRY_MS = 10000; // この時間内に幕のウィンドウを続けて作り直すときは、少し待つ
 
 // プレビューから転送を許可する入力イベント
 const INPUT_TYPES = new Set(['mouseDown', 'mouseUp', 'mouseMove', 'mouseWheel', 'keyDown', 'keyUp', 'char']);
@@ -577,38 +580,90 @@ app.whenReady().then(() => {
   }
   function curtainWindow() {
     if (curtainWin && !curtainWin.isDestroyed()) return curtainWin;
-    curtainWin = new BrowserWindow({
+    const win = new BrowserWindow({
       ...bounds, frame: false, show: false, transparent: true, hasShadow: false,
       focusable: false, skipTaskbar: true, resizable: false, alwaysOnTop: true,
       webPreferences: { backgroundThrottling: false },
     });
-    curtainWin.setAlwaysOnTop(true, 'screen-saver'); // exe のウィンドウより上に出す
+    curtainWin = win;
+    win.setAlwaysOnTop(true, 'screen-saver'); // exe のウィンドウより上に出す
+    // 幕のページが異常終了したら作り直す（透明なウィンドウなので、閉めていても裏が見えてしまう）
+    win.webContents.on('render-process-gone', (_e, { reason }) => {
+      if (reason === 'clean-exit' || curtainWin !== win) return;
+      logError(new Error(`幕のページが異常終了しました（${reason}）`));
+      curtainQueue = curtainQueue.then(() => reviveCurtain(win)).catch(logError);
+    });
     // クリックは幕で受け止める（閉めている間は、裏の表示用ウィンドウ・exe を誤って操作させない）
-    curtainWin.loadFile(path.join(__dirname, 'panel', 'curtain.html'), { query: { img: curtainImage() } });
-    return curtainWin;
+    win.loadFile(path.join(__dirname, 'panel', 'curtain.html'), { query: { img: curtainImage() } });
+    return win;
+  }
+  // p を ms だけ待つ。終わらなければ（幕のページが固まった・描画が止まった等）エラーにして先に進む
+  //   （待ち続けると、後の開け閉めがすべて止まり、パネルの表示だけが切り替わる）
+  const within = (p, ms, what) => {
+    let timer;
+    const timeout = new Promise((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what}が ${ms / 1000} 秒待っても終わりません`)), ms);
+    });
+    return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+  };
+  // 幕を動かす。動き終わったら解決する。instant: 動きを見せずに、すぐその状態にする
+  async function moveCurtain(win, close, instant = false) {
+    if (win.webContents.isLoading()) {
+      await within(new Promise((r) => win.webContents.once('did-finish-load', r)), CURTAIN_LOAD_MS, '幕の読み込み');
+    }
+    const show = () => {
+      win.showInactive(); // パネルからフォーカスを奪わない
+      win.setBounds(bounds); // 複数モニターにまたがると作成時に OS 側でサイズが調整されることがある
+    };
+    if (close && !instant) show(); // 下りてくる動きを見せる
+    await within(win.webContents.executeJavaScript(`curtain(${close}, ${instant})`), CURTAIN_STEP_MS, '幕の動き');
+    if (close && instant) show(); // 閉めた状態にしてから出す
+  }
+  // 幕のウィンドウ broken が使えなくなった（異常終了・固まった・読み込めない）ので作り直す。
+  // 閉めているはずなら、動きは省いてすぐ閉めた状態で出す。パネルにも出す（幕が一度消えたことに気づけるように）
+  let curtainRevivedAt = 0;
+  async function reviveCurtain(broken) {
+    if (curtainWin !== broken) return; // 既に作り直した
+    // 作り直してもすぐ使えなくなる場合に、休みなく繰り返さない
+    if (Date.now() - curtainRevivedAt < CURTAIN_RETRY_MS) await new Promise((r) => setTimeout(r, 1000));
+    curtainRevivedAt = Date.now();
+    if (!broken.isDestroyed()) broken.destroy();
+    curtainWin = null;
+    if (!curtainClosed) return; // 開けているなら、次に閉めるときに作る
+    try {
+      await moveCurtain(curtainWindow(), true, true);
+      setStatus('幕のウィンドウに異常があったため、幕を出し直しました（mywebview-error.log に記録しました）');
+    } catch (e) {
+      logError(e);
+      setStatus('幕を出せません。「画面を消す」で隠してください（mywebview-error.log に記録しました）');
+    }
   }
   function setCurtain(close) {
     // 疑似表示ではモニターに出していないので使わない（画面を消すと同じ）
     close = Boolean(close) && !virtual;
     if (close === curtainClosed) return curtainClosed;
     curtainClosed = close;
-    if (close) refocusOnCurtainOpen = focusBeforePanel() === 'display';
+    if (close) {
+      refocusOnCurtainOpen = focusBeforePanel() === 'display';
+      curtainWindow(); // 待たずに読み込み始める
+    }
     sendToPanel('display:curtain', close);
-    const win = curtainWindow();
     curtainQueue = curtainQueue.then(async () => {
-      if (win.isDestroyed()) return;
-      if (win.webContents.isLoading()) await new Promise((r) => win.webContents.once('did-finish-load', r));
-      if (close) {
-        win.showInactive(); // パネルからフォーカスを奪わない
-        win.setBounds(bounds); // 複数モニターにまたがると作成時に OS 側でサイズが調整されることがある
+      const win = close ? curtainWindow() : curtainWin; // 開けるときに無ければ（作り直せなかった等）何も出ていない
+      if (win && !win.isDestroyed()) {
+        try {
+          await moveCurtain(win, close);
+        } catch (e) {
+          logError(e);
+          await reviveCurtain(win);
+        }
       }
-      await win.webContents.executeJavaScript(`curtain(${close})`).catch(logError);
       // 開け終わったら隠す（透明でも最前面にあると負荷がかかる）。その間に閉め直されていたら隠さない
-      if (!close && !curtainClosed && !win.isDestroyed()) {
-        win.hide();
+      if (!close && !curtainClosed) {
+        if (curtainWin && !curtainWin.isDestroyed()) curtainWin.hide();
         if (refocusOnCurtainOpen) focusFront();
       }
-    });
+    }).catch(logError); // 想定外のエラーでも、後の開け閉めを止めない
     return curtainClosed;
   }
 

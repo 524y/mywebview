@@ -400,7 +400,14 @@ app.whenReady().then(() => {
       ...bounds,
       frame: false,            // タイトルバーなし
       show: false,
-      webPreferences: { backgroundThrottling: false, offscreen: virtual },
+      maximizable: false,
+      webPreferences: {
+        backgroundThrottling: false,
+        offscreen: virtual,
+        // ページの全画面表示（Google スライドのスライドショー・動画の全画面ボタン等）でも、ウィンドウを
+        // 1 つのモニターに縮めない（ページ側は全画面になり、表示領域いっぱいに広がる）
+        disableHtmlFullscreenWindowResize: true,
+      },
     });
     display = win;
     displayReady = false;
@@ -480,6 +487,15 @@ app.whenReady().then(() => {
       failed = false;
     });
     win.webContents.on('did-navigate-in-page', onNavigate);
+    // 最大化・全画面にされる（Win+↑・画面端へのドラッグ等）と 1 つのモニターに収まるので、表示領域に戻す
+    const keepBounds = () => setImmediate(() => {
+      if (win.isDestroyed()) return;
+      if (win.isFullScreen()) win.setFullScreen(false);
+      if (win.isMaximized()) win.unmaximize();
+      if (!virtual) win.setBounds(bounds);
+    });
+    win.on('maximize', keepBounds);
+    win.on('enter-full-screen', keepBounds);
     win.on('resize', onBoundsChange);
     win.on('move', onBoundsChange);
     win.on('show', onBoundsChange);

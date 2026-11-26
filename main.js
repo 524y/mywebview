@@ -1,6 +1,7 @@
 // main.js
 const { app, BrowserWindow, dialog, screen, ipcMain, powerSaveBlocker } = require('electron');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 const fs = require('node:fs');
 const { parseArgs } = require('node:util');
 const { parseExe, launchExe } = require('./exe');
@@ -23,6 +24,9 @@ const RETRY_MS = 5000;         // 読み込みに失敗したとき、再試行�
 const QUICK_CLOSE_MS = 3000;   // 表示してすぐにページがウィンドウを閉じたら、作り直さない（繰り返しを防ぐ）
 const FOCUS_POLL_MS = 300;     // フォーカスの場所を調べる間隔（パネルに表示する）
 const REPLACE_DELAY_MS = 1000; // モニター構成が変わってから置き直すまでの時間（OS がウィンドウを動かし終えるのを待つ）
+const CURTAIN_LOAD_MS = 10000;  // 幕のページの読み込みを待つ上限（幕の画像の読み込みを含む）
+const CURTAIN_STEP_MS = 10000;  // 幕の 1 回の動き（2.5 秒）を待つ上限
+const CURTAIN_RETRY_MS = 10000; // この時間内に幕のウィンドウを続けて作り直すときは、少し待つ
 
 // プレビューから転送を許可する入力イベント
 const INPUT_TYPES = new Set(['mouseDown', 'mouseUp', 'mouseMove', 'mouseWheel', 'keyDown', 'keyUp', 'char']);
@@ -527,20 +531,19 @@ app.whenReady().then(() => {
     onBoundsChange();
   }
 
+  // 幕は画面消去の黒いウィンドウより手前（黒いウィンドウを出し直したら、幕も出し直す）
+  const curtainShown = () => curtainWin && !curtainWin.isDestroyed() && curtainWin.isVisible();
   // ---- 画面を消す（表示領域を最前面の黒いウィンドウで覆う。Web ページ・exe のどちらの上にも出る） ----
   // プレビューには裏の実際の内容が映り続ける（消している間に次の準備ができる）
+  //   疑似表示の間は出さない（モニターに出していない。表示領域がパネルのモニターに重なることもある）。
+  //   消していたことは覚えておき、実表示に戻ったら消し直す（幕も同じ。placeCovers()）
   let blackout = false;
   let blackWin = null;
   //   戻したときは、消す前にフォーカスがあったのが表示側なら、表示側に戻す
   let refocusOnRestore = false;
-  function setBlackout(on) {
-    // 疑似表示ではモニターに出していない（表示領域がパネルのモニターに重なることもある）ので使わない
-    const next = Boolean(on) && !virtual;
-    if (next && !blackout) refocusOnRestore = focusBeforePanel() === 'display';
-    const restoring = blackout && !next;
-    blackout = next;
-    if (restoring && refocusOnRestore) setImmediate(focusFront); // 黒いウィンドウを隠してから
-    if (blackout) {
+  // 黒いウィンドウを今の状態に合わせる（消していて実表示なら表示領域に出し、そうでなければ隠す）
+  function placeBlack() {
+    if (blackout && !virtual) {
       if (!blackWin || blackWin.isDestroyed()) {
         blackWin = new BrowserWindow({
           ...bounds, frame: false, show: false, backgroundColor: '#000000', hasShadow: false,
@@ -551,11 +554,150 @@ app.whenReady().then(() => {
       }
       blackWin.showInactive(); // パネルからフォーカスを奪わない
       blackWin.setBounds(bounds); // 複数モニターにまたがると作成時に OS 側でサイズが調整されることがある
+      if (curtainShown()) curtainWin.moveTop();
     } else if (blackWin && !blackWin.isDestroyed()) {
       blackWin.hide();
     }
-    sendToPanel('display:blackout', blackout);
-    return blackout;
+  }
+  function setBlackout(on) {
+    if (on && virtual) return false; // 疑似表示の間は、新しく消せない（消していたことは覚えたまま）
+    const next = Boolean(on);
+    if (next && !blackout) refocusOnRestore = focusBeforePanel() === 'display';
+    const restoring = blackout && !next;
+    blackout = next;
+    if (restoring && refocusOnRestore) setImmediate(focusFront); // 黒いウィンドウを隠してから
+    placeBlack();
+    sendToPanel('display:blackout', blackout && !virtual);
+    return blackout && !virtual;
+  }
+
+  // ---- 緞帳（幕を下ろして表示領域を隠す・上げて見せる。透明なウィンドウを最前面に重ねて幕を動かす） ----
+  //   幕の絵柄は url_list.txt と同じ場所の curtain.png / .jpg / .webp（無ければ CSS で描いた赤い幕）。
+  //   閉めている間もプレビューには裏の実際の内容が映る。開けたら、閉める前に表示側にあったフォーカスを戻す
+  //   動いている間に押し直したら、その位置から向きを変える（押した回数だけ順に動かすことはしない）
+  let curtainClosed = false; // 閉めている（疑似表示の間は出さないが、覚えておいて実表示に戻ったら出し直す）
+  let curtainWin = null;
+  let curtainQueue = Promise.resolve(); // 幕のウィンドウの作り直しを 1 つずつ行う
+  let refocusOnCurtainOpen = false;
+  function curtainImage() {
+    const dir = path.dirname(findUrlListPath());
+    const file = ['curtain.png', 'curtain.jpg', 'curtain.jpeg', 'curtain.webp']
+      .map((n) => path.join(dir, n)).find((p) => fs.existsSync(p));
+    return file ? pathToFileURL(file).href : '';
+  }
+  // 幕のウィンドウ broken を作り直す（順番待ち。reviveCurtain()）
+  const reviveCurtainLater = (broken) => {
+    curtainQueue = curtainQueue.then(() => reviveCurtain(broken)).catch(logError);
+  };
+  function curtainWindow() {
+    if (curtainWin && !curtainWin.isDestroyed()) return curtainWin;
+    const win = new BrowserWindow({
+      ...bounds, frame: false, show: false, transparent: true, hasShadow: false,
+      focusable: false, skipTaskbar: true, resizable: false, alwaysOnTop: true,
+      webPreferences: { backgroundThrottling: false },
+    });
+    curtainWin = win;
+    win.setAlwaysOnTop(true, 'screen-saver'); // exe のウィンドウより上に出す
+    // 幕のページが異常終了したら作り直す（透明なウィンドウなので、閉めていても裏が見えてしまう）
+    win.webContents.on('render-process-gone', (_e, { reason }) => {
+      if (reason === 'clean-exit' || curtainWin !== win) return;
+      logError(new Error(`幕のページが異常終了しました（${reason}）`));
+      reviveCurtainLater(win);
+    });
+    // クリックは幕で受け止める（閉めている間は、裏の表示用ウィンドウ・exe を誤って操作させない）
+    win.loadFile(path.join(__dirname, 'panel', 'curtain.html'), { query: { img: curtainImage() } });
+    return win;
+  }
+  // p を ms だけ待つ。終わらなければ（幕のページが固まった・描画が止まった等）エラーにする
+  const within = (p, ms, what) => {
+    let timer;
+    const timeout = new Promise((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what}が ${ms / 1000} 秒待っても終わりません`)), ms);
+    });
+    return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+  };
+  // 幕を動かす。instant: 動きを見せずに、すぐその状態にする
+  //   → 動き終わったら true。動いている間に次の指示が来たら false（幕のページが、その位置から次の指示に移る）
+  async function moveCurtain(win, close, instant = false) {
+    if (win.webContents.isLoading()) {
+      await within(new Promise((r) => win.webContents.once('did-finish-load', r)), CURTAIN_LOAD_MS, '幕の読み込み');
+    }
+    const show = () => {
+      // 待っている間に、開け直された・疑似表示になった・作り直されたときは出さない
+      if (!curtainClosed || virtual || win.isDestroyed()) return;
+      win.showInactive(); // パネルからフォーカスを奪わない
+      win.setBounds(bounds); // 複数モニターにまたがると作成時に OS 側でサイズが調整されることがある
+    };
+    if (close && !instant) show(); // 下りてくる動きを見せる
+    const done = await within(
+      win.webContents.executeJavaScript(`curtain(${close}, ${instant})`), CURTAIN_STEP_MS, '幕の動き');
+    if (close && instant && done) show(); // 閉めた状態にしてから出す
+    return done;
+  }
+  // 閉めているはずの幕を、動きは省いてすぐ閉めた状態で出す（幕のウィンドウを作り直したとき）
+  async function recloseCurtain(message) {
+    try {
+      await moveCurtain(curtainWindow(), true, true);
+      if (message) setStatus(message);
+    } catch (e) {
+      logError(e);
+      setStatus('幕を出せません。「画面を消す」で隠してください（mywebview-error.log に記録しました）');
+    }
+  }
+  // 幕のウィンドウ broken が使えなくなった（異常終了・固まった・読み込めない）ので作り直す。
+  // 閉めているはずなら、すぐ閉めた状態で出す。パネルにも出す（幕が一度消えたことに気づけるように）
+  let curtainRevivedAt = 0;
+  async function reviveCurtain(broken) {
+    if (curtainWin !== broken) return; // 既に作り直した
+    // 作り直してもすぐ使えなくなる場合に、休みなく繰り返さない
+    if (Date.now() - curtainRevivedAt < CURTAIN_RETRY_MS) await new Promise((r) => setTimeout(r, 1000));
+    curtainRevivedAt = Date.now();
+    if (!broken.isDestroyed()) broken.destroy();
+    curtainWin = null;
+    if (!curtainClosed) return; // 開けているなら、次に閉めるときに作る
+    await recloseCurtain('幕のウィンドウに異常があったため、幕を出し直しました（mywebview-error.log に記録しました）');
+  }
+  function setCurtain(close) {
+    if (close && virtual) return false; // 疑似表示の間は、新しく閉められない（閉めていたことは覚えたまま）
+    close = Boolean(close);
+    if (close === curtainClosed) return curtainClosed && !virtual;
+    curtainClosed = close;
+    if (close) refocusOnCurtainOpen = focusBeforePanel() === 'display';
+    sendToPanel('display:curtain', close);
+    const win = close ? curtainWindow() : curtainWin; // 開けるときに無ければ（作り直せなかった等）何も出ていない
+    if (!win || win.isDestroyed()) return close;
+    // 前の動きが終わるのを待たずに指示する（幕のページが、今の位置から向きを変える）
+    moveCurtain(win, close).then((done) => {
+      // 開け終わったら隠す（透明でも最前面にあると負荷がかかる）。その間に閉め直されていたら隠さない
+      if (done && !close && !curtainClosed) {
+        if (!win.isDestroyed()) win.hide();
+        if (refocusOnCurtainOpen) focusFront();
+      }
+    }).catch((e) => {
+      logError(e);
+      reviveCurtainLater(win);
+    });
+    return close;
+  }
+  // 幕・画面消去のウィンドウを今の状態に合わせる: 実表示なら表示領域に出し（置き直し）、疑似表示の間は隠す。
+  //   疑似表示に切り替わっても、閉めていた・消していたことは覚えておき、実表示に戻ったら出し直す
+  //   （モニターが一時的に外れただけで、隠していた内容が見えてしまわないように）
+  function placeCovers() {
+    placeBlack();
+    const win = curtainWin && !curtainWin.isDestroyed() ? curtainWin : null;
+    if (virtual) {
+      if (win) win.hide(); // 閉めた状態のまま隠しておく
+    } else if (curtainClosed) {
+      if (win) {
+        win.showInactive();
+        win.setBounds(bounds);
+      } else {
+        curtainQueue = curtainQueue.then(() => { if (curtainClosed && !virtual) return recloseCurtain(); }).catch(logError);
+      }
+    }
+    // パネルには、今モニターに出ているかを伝える（疑似表示の間は、どちらのボタンも使えない）
+    sendToPanel('display:blackout', blackout && !virtual);
+    sendToPanel('display:curtain', curtainClosed && !virtual);
   }
 
   // 疑似表示 ⇔ 実表示 の切り替え（表示用ウィンドウを作り直し、同じ URL を読み込み直す）
@@ -567,10 +709,13 @@ app.whenReady().then(() => {
     previewTimer = null;
     if (alive()) display.destroy();
     virtual = next;
-    if (virtual) setBlackout(false);
+    // 幕・画面消去は、疑似表示の間は隠し、実表示に戻したら出し直す（表示用ウィンドウを出す前に）
+    const covers = [curtainClosed && '幕', blackout && '画面消去'].filter(Boolean).join('・');
+    placeCovers();
     lastFrame = null;
     createDisplay(url);
     switching = false;
+    if (covers && !virtual) setStatus(`実表示に戻ったため、${covers}を元に戻しました`);
     return virtual;
   }
 
@@ -689,7 +834,7 @@ app.whenReady().then(() => {
       if (opts.auto) relayout();
       if (front) front.show();
       else if (alive() && displayReady && (!virtual || opts.auto)) display.setBounds(bounds); // 疑似表示はサイズだけ
-      if (blackout) setBlackout(true);
+      placeCovers();
       onBoundsChange();
     }, REPLACE_DELAY_MS);
   };
@@ -713,7 +858,6 @@ app.whenReady().then(() => {
         }
       }
     }
-    if (blackout && virtual) setBlackout(false);
     layoutNotes = layoutNotesFor(l);
     // パネルをプライマリに置き直す。既にプライマリで最大化されていれば触らない（最大化し直すとパネルが
     // アクティブになり、表示側からフォーカスを奪う。モニターが一瞬切れただけで発表者のキー操作が効かなくなる）
@@ -773,7 +917,8 @@ app.whenReady().then(() => {
     frame: lastFrame,
     source: sourceId(),
     running: [...exes.keys()],
-    blackout,
+    blackout: blackout && !virtual, // 疑似表示の間は出していない（実表示に戻ったら出し直す）
+    curtain: curtainClosed && !virtual,
     focus,
     status,
     previewOn,
@@ -805,6 +950,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('panel:set-virtual', (_e, on) => setVirtual(Boolean(on)));
   ipcMain.handle('panel:set-blackout', (_e, on) => setBlackout(on));
+  ipcMain.handle('panel:set-curtain', (_e, close) => setCurtain(close));
   ipcMain.handle('panel:reload-list', () => loadUrlList());
   // ブラウザ表示の「戻る」「進む」「再読み込み」（exe を前に出している間も、裏のページに対して行う）
   //   ボタンを押すとパネルにフォーカスが移るので、押す前に表示側にあったら戻す

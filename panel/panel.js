@@ -236,6 +236,8 @@ function setModeState(v) {
   modeBtn.classList.toggle('on', !v);
   blackoutBtn.disabled = v; // 疑似表示ではモニターに出していない
   blackoutBtn.title = v ? '疑似表示中は使えません' : '表示領域（モニター）を真っ黒にします';
+  curtainBtn.disabled = v;
+  curtainBtn.title = v ? '疑似表示中は使えません' : '表示領域（モニター）に幕を下ろします';
 }
 
 // ---- 画面を消す ----
@@ -249,6 +251,22 @@ function setBlackoutState(on) {
 }
 blackoutBtn.addEventListener('click', async () => setBlackoutState(await window.api.setBlackout(!blackout)));
 window.api.onBlackout(setBlackoutState);
+
+// ---- 緞帳 ----
+const curtainBtn = $('#curtain');
+let curtainClosed = false;
+function setCurtainState(closed) {
+  curtainClosed = closed;
+  curtainBtn.classList.toggle('active', closed);
+  curtainBtn.textContent = closed ? '幕を開ける' : '幕を閉める';
+  $('#frame').classList.toggle('curtain', closed);
+}
+curtainBtn.addEventListener('click', async (e) => {
+  // ダブルクリック・連打の 2 回目以降は数えない（開けてすぐ閉め直してしまう）。キーボードで押したときは 0
+  if (e.detail > 1) return;
+  setCurtainState(await window.api.setCurtain(!curtainClosed));
+});
+window.api.onCurtain(setCurtainState);
 modeBtn.addEventListener('click', async () => {
   modeBtn.disabled = true;
   try {
@@ -431,6 +449,7 @@ window.api.onBounds(setupPreview);
   if (s.frame && !img.src) showFrame(s.frame);
   if (s.status) msg.textContent = s.status;
   setBlackoutState(s.blackout);
+  setCurtainState(s.curtain);
   exeSource = s.source;
   updateVideo();
 })();

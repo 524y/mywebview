@@ -133,6 +133,26 @@
     <button id="mode-toggle" type="button" class="btn"
             title="疑似表示: モニターには出さずプレビューのみ / 実表示: モニターに表示">表示モード</button>
     <button id="preview-toggle" type="button" class="btn">プレビュー</button>
+    <select id="effect" class="btn" title="URL・exe を切り替えるときの効果（疑似表示・幕・画面消去の間はかけません）">
+      <option value="none">効果なし</option>
+      <option value="fade">フェード</option>
+      <option value="tiles">タイル（パッと）</option>
+      <option value="tiles-fade">タイル（フェード）</option>
+      <option value="tiles-flip">タイル（回転）</option>
+    </select>
+    <select id="effect-ms" class="btn" title="切り替え効果の時間">
+      <option value="500">0.5 秒</option>
+      <option value="1000">1 秒</option>
+      <option value="2000">2 秒</option>
+      <option value="3000">3 秒</option>
+      <option value="5000">5 秒</option>
+      <option value="8000">8 秒</option>
+    </select>
+    <select id="effect-order" class="btn" title="タイルを入れ替える順番">
+      <option value="random">ランダム</option>
+      <option value="rows">左上から横へ</option>
+      <option value="cols">左上から縦へ</option>
+    </select>
     <button id="curtain" type="button" class="btn" title="表示領域（モニター）に幕を下ろします">幕を閉める</button>
     <button id="blackout" type="button" class="btn" title="表示領域（モニター）を真っ黒にします">画面を消す</button>
   </form>

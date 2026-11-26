@@ -1,5 +1,5 @@
 // main.js
-const { app, BrowserWindow, dialog, screen, ipcMain, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, dialog, screen, ipcMain, powerSaveBlocker, desktopCapturer } = require('electron');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const fs = require('node:fs');
@@ -27,6 +27,13 @@ const REPLACE_DELAY_MS = 1000; // モニター構成が変わってから置き�
 const CURTAIN_LOAD_MS = 10000;  // 幕のページの読み込みを待つ上限（幕の画像の読み込みを含む）
 const CURTAIN_STEP_MS = 10000;  // 幕の 1 回の動き（2.5 秒）を待つ上限
 const CURTAIN_RETRY_MS = 10000; // この時間内に幕のウィンドウを続けて作り直すときは、少し待つ
+const TRANSITION_EFFECTS = ['none', 'fade', 'tiles', 'tiles-fade', 'tiles-flip']; // 切り替え効果（transition.js）
+const TRANSITION_ORDERS = ['random', 'rows', 'cols']; // タイルの順番: ランダム / 左上から右へ、行ごとに / 左上から下へ、列ごとに
+const TRANSITION_STEP_MS = 5000;  // 切り替え前の画面の取得・表示を待つ上限（超えたら効果なしで切り替える）
+const TRANSITION_LOAD_MS = 10000; // 新しいページの読み込みを待つ上限（超えたら読み込み途中でも見せる）
+const TRANSITION_EXE_MS = 15000;  // 新しく起動した exe のウィンドウが出るのを待つ上限
+const TRANSITION_SETTLE_MS = 500;      // 読み込み後、ページが描き終わるのを待つ時間
+const TRANSITION_EXE_SETTLE_MS = 1000; // exe を前に出した後、配置・描画が落ち着くのを待つ時間
 
 // プレビューから転送を許可する入力イベント
 const INPUT_TYPES = new Set(['mouseDown', 'mouseUp', 'mouseMove', 'mouseWheel', 'keyDown', 'keyUp', 'char']);
@@ -78,6 +85,7 @@ function parseOptions() {
       debug:  { type: 'boolean' },
       virtual: { type: 'boolean' },
       real:   { type: 'boolean' },
+      grid:   { type: 'string' },
     },
     allowPositionals: true,
     strict: false, // Chromium のスイッチ等の未知オプションは無視
@@ -96,6 +104,10 @@ function parseOptions() {
     throw new Error('--virtual と --real は同時に指定できません');
   }
 
+  // 切り替え効果のタイルの数（横×縦）。既定は 3×3 台のモニター（HDMI 1 本分）が横に 3 つ並んだ 9×3
+  const grid = (values.grid === undefined || values.grid === true ? '9x3' : String(values.grid)).match(/^(\d+)[x×*](\d+)$/i);
+  if (!grid || +grid[1] < 1 || +grid[2] < 1) throw new Error(`--grid は 9x3 のように指定してください: ${values.grid}`);
+
   const raw = positionals[0] ?? DEFAULTS.url;
   if (!parseTarget(raw)) throw new Error(`不正な URL です: ${raw}`);
 
@@ -110,6 +122,8 @@ function parseOptions() {
     debug:  values.debug === true,
     virtual: values.virtual === true,
     real:   values.real === true,
+    cols:   +grid[1],
+    rows:   +grid[2],
   };
 }
 
@@ -719,6 +733,139 @@ app.whenReady().then(() => {
     return virtual;
   }
 
+  // ---- 切り替え効果（試作） ----
+  //   切り替え前の画面を静止画で撮って一番手前の透明なウィンドウに出し、その裏で新しい表示に切り替えて
+  //   読み込みを待ってから、静止画を消していく（フェード・タイルをランダムに 1 枚ずつ等。transition.js）
+  //   疑似表示・幕を閉めている・画面を消しているときは、効果なしで切り替える（モニターには見えない）
+  let transition = { effect: 'none', ms: 2000, order: 'random' };
+  let transWin = null;
+  let transBusy = false; // 効果の途中（その間の切り替えは効果なしで行い、続きの効果がそのまま見せる）
+  function transitionWindow() {
+    if (transWin && !transWin.isDestroyed()) return transWin;
+    const win = new BrowserWindow({
+      ...bounds, frame: false, show: false, transparent: true, hasShadow: false,
+      focusable: false, skipTaskbar: true, resizable: false, alwaysOnTop: true,
+      webPreferences: { backgroundThrottling: false },
+    });
+    transWin = win;
+    win.setAlwaysOnTop(true, 'screen-saver'); // exe のウィンドウより上に出す
+    // 異常終了したら捨てる（次の切り替えで作り直す。静止画が残って新しい表示を隠さないよう、すぐ隠す）
+    win.webContents.on('render-process-gone', (_e, { reason }) => {
+      if (reason === 'clean-exit') return;
+      logError(new Error(`切り替え効果のページが異常終了しました（${reason}）`));
+      if (transWin === win) transWin = null;
+      win.destroy();
+    });
+    win.loadFile(path.join(__dirname, 'panel', 'transition.html'));
+    return win;
+  }
+  const toShot = (img, x, y, w, h) => ({ src: `data:image/jpeg;base64,${img.toJPEG(90).toString('base64')}`, x, y, w, h });
+  // 今モニターに出ている表示を撮る → transition.js の cover() に渡す形。撮れなければ null
+  //   Web ページはページだけを撮る。exe は表示領域に重なるモニターの画面ごとに撮る
+  async function captureFront() {
+    if (!front) {
+      if (!alive() || !displayReady || !display.isVisible()) return null;
+      const img = await display.webContents.capturePage();
+      return img.isEmpty() ? null : [toShot(img, 0, 0, 1, 1)];
+    }
+    const ds = screen.getAllDisplays().filter((d) => {
+      const b = d.bounds;
+      return b.x < bounds.x + bounds.width && bounds.x < b.x + b.width && b.y < bounds.y + bounds.height && bounds.y < b.y + b.height;
+    });
+    if (!ds.length) return null;
+    const size = {
+      width: Math.max(...ds.map((d) => Math.round(d.bounds.width * d.scaleFactor))),
+      height: Math.max(...ds.map((d) => Math.round(d.bounds.height * d.scaleFactor))),
+    };
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: size });
+    const shots = [];
+    for (const d of ds) {
+      const s = sources.find((v) => v.display_id === String(d.id));
+      if (!s || s.thumbnail.isEmpty()) return null; // 一部でも撮れなければ効果なし（古い表示が欠けて見える）
+      const b = d.bounds;
+      shots.push(toShot(s.thumbnail, (b.x - bounds.x) / bounds.width, (b.y - bounds.y) / bounds.height,
+        b.width / bounds.width, b.height / bounds.height));
+    }
+    return shots;
+  }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // 切り替えた後の表示が出そろうのを待つ（上限あり。新しいページの読み込み・exe のウィンドウが見つかるまで）
+  async function waitShown() {
+    await sleep(100);
+    const start = Date.now();
+    if (!front) {
+      while (Date.now() - start < TRANSITION_LOAD_MS && !front &&
+          (!alive() || !displayReady || display.webContents.isLoading())) await sleep(100);
+      await sleep(TRANSITION_SETTLE_MS);
+      return;
+    }
+    const exe = front;
+    while (Date.now() - start < TRANSITION_EXE_MS && front === exe && !exe.ended && !(exe.hwnd && exe.rect())) await sleep(100);
+    await sleep(TRANSITION_EXE_SETTLE_MS);
+  }
+  // 静止画を消して切り替え効果のウィンドウを隠す（次に出したときに古い静止画が見えないよう、消してから隠す）
+  async function hideTransition(win) {
+    if (!win || win.isDestroyed()) return;
+    try {
+      await within(win.webContents.executeJavaScript('clear()'), TRANSITION_STEP_MS, '切り替え効果の片付け');
+    } catch (e) {
+      logError(e);
+      win.destroy(); // 静止画が残ったままかもしれないので捨てる（次の切り替えで作り直す）
+      if (transWin === win) transWin = null;
+      return;
+    }
+    if (!win.isDestroyed()) win.hide();
+  }
+  // action（表示を切り替える関数。エラーならメッセージを返す）を、切り替え効果をかけて行う
+  async function switchWithEffect(action) {
+    const { effect, ms, order } = transition;
+    if (effect === 'none' || transBusy || virtual || curtainClosed || blackout) return action();
+    transBusy = true;
+    let win = null;
+    try {
+      // 切り替え前の画面を出す。うまくいかなければ効果なしで切り替える（本番の切り替えを止めない）
+      try {
+        const shots = await within(captureFront(), TRANSITION_STEP_MS, '切り替え前の画面の取得');
+        if (!shots || virtual || curtainClosed || blackout) return action();
+        win = transitionWindow();
+        if (win.webContents.isLoading()) {
+          await within(new Promise((r) => win.webContents.once('did-finish-load', r)), TRANSITION_STEP_MS, '切り替え効果の読み込み');
+        }
+        win.showInactive(); // パネルからフォーカスを奪わない（透明なので、静止画を描くまでは何も変わらない）
+        win.setBounds(bounds); // 複数モニターにまたがると作成時に OS 側でサイズが調整されることがある
+        win.moveTop();
+        const drawn = await within(win.webContents.executeJavaScript(
+          `cover(${JSON.stringify(shots)}, ${opts.cols}, ${opts.rows})`), TRANSITION_STEP_MS, '切り替え前の画面の表示');
+        if (!drawn) throw new Error('切り替え前の画面を表示できません');
+      } catch (e) {
+        logError(e);
+        await hideTransition(win);
+        win = null;
+        return action();
+      }
+      const err = action();
+      if (err) return err;
+      await waitShown();
+      await within(win.webContents.executeJavaScript(`reveal(${JSON.stringify(effect)}, ${ms}, ${JSON.stringify(order)})`),
+        ms + TRANSITION_STEP_MS, '切り替え効果');
+      return null;
+    } catch (e) {
+      logError(e);
+      return null;
+    } finally {
+      await hideTransition(win);
+      transBusy = false;
+    }
+  }
+  function setTransition(next) {
+    const effect = TRANSITION_EFFECTS.includes(next?.effect) ? next.effect : transition.effect;
+    const ms = Number.isFinite(next?.ms) ? Math.min(Math.max(Math.round(next.ms), 200), 20000) : transition.ms;
+    const order = TRANSITION_ORDERS.includes(next?.order) ? next.order : transition.order;
+    transition = { effect, ms, order };
+    if (effect !== 'none' && !virtual) transitionWindow(); // 先に読み込んでおく（最初の切り替えで待たないよう）
+    return transition;
+  }
+
   // ---- 表示の切り替え ----
   // 前に出すものを切り替える（next: exe か null = Web ページ）。前に出ていたものは隠す（exe は最小化）
   //   focus: 前に出したウィンドウにフォーカスを移す（パネルで選んだとき）。疑似表示の Web ページは画面に無いので移さない
@@ -923,16 +1070,18 @@ app.whenReady().then(() => {
     status,
     previewOn,
     virtual,
+    transition,
+    grid: { cols: opts.cols, rows: opts.rows },
   }));
-  ipcMain.handle('panel:navigate', (_e, raw) => show(raw, { focus: true }));
+  ipcMain.handle('panel:navigate', (_e, raw) => switchWithEffect(() => show(raw, { focus: true })));
   // ブラウザ表示に戻す（読み込み直さず、今のページのまま前に出す）
-  ipcMain.handle('panel:show-web', () => {
+  ipcMain.handle('panel:show-web', () => switchWithEffect(() => {
     if (alive()) {
       bringToFront(null, { focus: true });
       return null;
     }
     return show(lastUrl, { focus: true }); // 閉じていたら（すぐ閉じるページ等）最後の URL で開き直す
-  });
+  }));
   // exe を閉じる（text 省略時は前に出ている exe）。exe は枠を消しているので閉じるボタンが無い
   ipcMain.handle('panel:close-exe', (_e, text) => {
     const exe = text ? exes.get(text) : front;
@@ -951,6 +1100,7 @@ app.whenReady().then(() => {
   ipcMain.handle('panel:set-virtual', (_e, on) => setVirtual(Boolean(on)));
   ipcMain.handle('panel:set-blackout', (_e, on) => setBlackout(on));
   ipcMain.handle('panel:set-curtain', (_e, close) => setCurtain(close));
+  ipcMain.handle('panel:set-transition', (_e, t) => setTransition(t));
   ipcMain.handle('panel:reload-list', () => loadUrlList());
   // ブラウザ表示の「戻る」「進む」「再読み込み」（exe を前に出している間も、裏のページに対して行う）
   //   ボタンを押すとパネルにフォーカスが移るので、押す前に表示側にあったら戻す

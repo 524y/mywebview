@@ -267,6 +267,24 @@ curtainBtn.addEventListener('click', async (e) => {
   setCurtainState(await window.api.setCurtain(!curtainClosed));
 });
 window.api.onCurtain(setCurtainState);
+// ---- 切り替え効果 ----
+const effectSel = $('#effect');
+const effectMs = $('#effect-ms');
+const effectOrder = $('#effect-order');
+function setTransitionState({ effect, ms, order }) {
+  effectSel.value = effect;
+  if (![...effectMs.options].some((o) => +o.value === ms)) effectMs.append(new Option(`${ms / 1000} 秒`, ms));
+  effectMs.value = String(ms);
+  effectMs.disabled = effect === 'none';
+  effectOrder.value = order;
+  effectOrder.disabled = !effect.startsWith('tiles');
+}
+const sendTransition = async () => setTransitionState(
+  await window.api.setTransition({ effect: effectSel.value, ms: +effectMs.value, order: effectOrder.value }));
+effectSel.addEventListener('change', sendTransition);
+effectMs.addEventListener('change', sendTransition);
+effectOrder.addEventListener('change', sendTransition);
+
 modeBtn.addEventListener('click', async () => {
   modeBtn.disabled = true;
   try {
@@ -450,6 +468,8 @@ window.api.onBounds(setupPreview);
   if (s.status) msg.textContent = s.status;
   setBlackoutState(s.blackout);
   setCurtainState(s.curtain);
+  setTransitionState(s.transition);
+  for (const o of effectSel.options) if (o.value.startsWith('tiles')) o.textContent += ` ${s.grid.cols}×${s.grid.rows}`;
   exeSource = s.source;
   updateVideo();
 })();

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src data:; style-src 'self' 'unsafe-inline'; script-src 'self'">
+<title>mywebview 切り替え効果</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; cursor: none; }
+  /* 切り替え前の画面（静止画）。タイルに分けて並べ、消していくと裏の新しい表示が見える */
+  #t { position: absolute; inset: 0; }
+  #t canvas { position: absolute; display: block; will-change: transform, opacity; }
+</style>
+</head>
+<body>
+  <div id="t"></div>
+  <script src="transition.js"></script>
+</body>
+</html>

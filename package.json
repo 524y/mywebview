@@ -1,6 +1,6 @@
 {
   "name": "mywebview",
-  "version": "1.3.0-beta.4",
+  "version": "1.3.0",
   "description": "プレゼン用 webview",
   "main": "main.js",
   "scripts": {
